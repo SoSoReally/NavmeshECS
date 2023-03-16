@@ -364,7 +364,72 @@ namespace Game.Navmesh
     }
 
 
-    public partial class NavmeshSystem : ComponentSystemGroup { }
+    public partial class NavmeshSystem : ComponentSystemGroup {
+    
+    
+    }
+
+    public static class NavmeshUtility
+    {
+        public static void Setup(Entity e, EntityManager entityManager)
+        {
+            entityManager.AddComponentData<NavAgentComponent>(e, new NavAgentComponent() { angleSpeed = 30f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f });
+            entityManager.AddComponentData<NavAgentTransform>(e, new NavAgentTransform() { position = Unity.Mathematics.float3.zero, rotation = quaternion.identity });
+            entityManager.AddComponentData<NavAgentPathSteer>(e, new NavAgentPathSteer() { TargetPointIndex = 0, PickWayPointDistance = 0.2f });
+            entityManager.AddComponentData<NavAgentLocation>(e, new NavAgentLocation() { });
+            entityManager.AddComponentData<RequestPath>(e, default);
+            entityManager.AddComponentData<PathInfo>(e, default);
+            entityManager.AddBuffer<WayPoint>(e);
+            entityManager.SetComponentEnabled<RequestPath>(e, false);
+            entityManager.SetComponentEnabled<NavAgentComponent>(e, false);
+        }
+        public static void Setup(NativeArray<Entity> e, EntityManager entityManager)
+        {
+            FixedList128Bytes<ComponentType> comList = new FixedList128Bytes<ComponentType>
+            {
+                Length = 7
+            };
+            comList.Clear();
+            comList.AddNoResize(ComponentType.ReadWrite<NavAgentComponent>());
+            comList.AddNoResize(ComponentType.ReadWrite<NavAgentTransform>());
+            comList.AddNoResize(ComponentType.ReadWrite<NavAgentPathSteer>());
+            comList.AddNoResize(ComponentType.ReadWrite<NavAgentLocation>());
+            comList.AddNoResize(ComponentType.ReadWrite<RequestPath>());
+            comList.AddNoResize(ComponentType.ReadWrite<PathInfo>());
+            comList.AddNoResize(ComponentType.ReadWrite<WayPoint>());
+            entityManager.AddComponent(e, new ComponentTypeSet(comList));
+            for (int i = 0; i < e.Length; i++)
+            {
+                entityManager.SetComponentData<NavAgentComponent>(e[i], new NavAgentComponent() { angleSpeed = 30f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f });
+                entityManager.SetComponentData<NavAgentTransform>(e[i], new NavAgentTransform() { position = Unity.Mathematics.float3.zero, rotation = quaternion.identity });
+                entityManager.SetComponentData<NavAgentPathSteer>(e[i], new NavAgentPathSteer() { TargetPointIndex = 0, PickWayPointDistance = 0.2f });
+                entityManager.SetComponentData<NavAgentLocation>(e[i], new NavAgentLocation() { });
+                entityManager.SetComponentEnabled<RequestPath>(e[i], false);
+                entityManager.SetComponentEnabled<NavAgentComponent>(e[i], false);
+            }
+
+        }
+        public static void Remove(NativeArray<Entity> entities, EntityManager entityManager)
+        {
+            entityManager.RemoveComponent<NavAgentComponent>(entities);
+            entityManager.RemoveComponent<NavAgentTransform>(entities);
+            entityManager.RemoveComponent<NavAgentPathSteer>(entities);
+            entityManager.RemoveComponent<NavAgentLocation>(entities);
+            entityManager.RemoveComponent<RequestPath>(entities);
+            entityManager.RemoveComponent<PathInfo>(entities);
+            entityManager.RemoveComponent<WayPoint>(entities);
+        }
+        public static void Remove(Entity entities, EntityManager entityManager)
+        {
+            entityManager.RemoveComponent<NavAgentComponent>(entities);
+            entityManager.RemoveComponent<NavAgentTransform>(entities);
+            entityManager.RemoveComponent<NavAgentPathSteer>(entities);
+            entityManager.RemoveComponent<NavAgentLocation>(entities);
+            entityManager.RemoveComponent<RequestPath>(entities);
+            entityManager.RemoveComponent<PathInfo>(entities);
+            entityManager.RemoveComponent<WayPoint>(entities);
+        }
+    }
 
 #if UNITY_EDITOR
     public struct OnlyTest : IComponentData
@@ -518,7 +583,6 @@ namespace Game.Navmesh
         protected override void OnCreate()
         {
             endBuffer = World.GetExistingSystemManaged<EndSimulationEntityCommandBufferSystem>();
-
             var allSlot = PathSetting.Process * PathSetting.PreQuerySlot;
             QueryECSArray = new NativeArray<QueryECS>(PathSetting.Process, Allocator.Persistent, NativeArrayOptions.ClearMemory);
             QuerySlotArray = new NativeArray<QuerySlot>(allSlot, Allocator.Persistent, NativeArrayOptions.ClearMemory);
@@ -865,64 +929,13 @@ namespace Game.Navmesh
             base.OnDestroy();
         }
 
-        public void Setup(Entity e)
-        {
-            World.EntityManager.AddComponentData<NavAgentComponent>(e, new NavAgentComponent() { angleSpeed = 30f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f });
-            World.EntityManager.AddComponentData<NavAgentTransform>(e, new NavAgentTransform() { position = Unity.Mathematics.float3.zero, rotation = quaternion.identity });
-            World.EntityManager.AddComponentData<NavAgentPathSteer>(e, new NavAgentPathSteer() { TargetPointIndex = 0, PickWayPointDistance = 0.2f });
-            World.EntityManager.AddComponentData<NavAgentLocation>(e, new NavAgentLocation() { });
-            World.EntityManager.AddComponentData<RequestPath>(e, default);
-            World.EntityManager.AddComponentData<PathInfo>(e, default);
-            World.EntityManager.AddBuffer<WayPoint>(e);
-            World.EntityManager.SetComponentEnabled<RequestPath>(e, false);
-            World.EntityManager.SetComponentEnabled<NavAgentComponent>(e, false);
-        }
-        public void Setup(NativeArray<Entity> e)
-        {
-            World.EntityManager.AddComponent<NavAgentComponent>(e);
-            World.EntityManager.AddComponent<NavAgentTransform>(e);
-            World.EntityManager.AddComponent<NavAgentPathSteer>(e);
-            World.EntityManager.AddComponent<NavAgentLocation>(e);
-            World.EntityManager.AddComponent<RequestPath>(e);
-            World.EntityManager.AddComponent<PathInfo>(e);
-            for (int i = 0; i < e.Length; i++)
-            {
-                World.EntityManager.SetComponentData<NavAgentComponent>(e[i], new NavAgentComponent() { angleSpeed = 30f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f });
-                World.EntityManager.SetComponentData<NavAgentTransform>(e[i], new NavAgentTransform() { position = Unity.Mathematics.float3.zero, rotation = quaternion.identity });
-                World.EntityManager.SetComponentData<NavAgentPathSteer>(e[i], new NavAgentPathSteer() { TargetPointIndex = 0, PickWayPointDistance = 0.2f });
-                World.EntityManager.SetComponentData<NavAgentLocation>(e[i], new NavAgentLocation() { });
-                World.EntityManager.SetComponentEnabled<RequestPath>(e[i], false);
-                World.EntityManager.SetComponentEnabled<NavAgentComponent>(e[i], false);
-                World.EntityManager.AddBuffer<WayPoint>(e[i]);
-            }
 
-        }
-        public void Remove(NativeArray<Entity> entities)
-        {
-            World.EntityManager.RemoveComponent<NavAgentComponent>(entities);
-            World.EntityManager.RemoveComponent<NavAgentTransform>(entities);
-            World.EntityManager.RemoveComponent<NavAgentPathSteer>(entities);
-            World.EntityManager.RemoveComponent<NavAgentLocation>(entities);
-            World.EntityManager.RemoveComponent<RequestPath>(entities);
-            World.EntityManager.RemoveComponent<PathInfo>(entities);
-            World.EntityManager.RemoveComponent<WayPoint>(entities);
-        }
-        public void Remove(Entity entities)
-        {
-            World.EntityManager.RemoveComponent<NavAgentComponent>(entities);
-            World.EntityManager.RemoveComponent<NavAgentTransform>(entities);
-            World.EntityManager.RemoveComponent<NavAgentPathSteer>(entities);
-            World.EntityManager.RemoveComponent<NavAgentLocation>(entities);
-            World.EntityManager.RemoveComponent<RequestPath>(entities);
-            World.EntityManager.RemoveComponent<PathInfo>(entities);
-            World.EntityManager.RemoveComponent<WayPoint>(entities);
-        }
 
         public void SetEnable(Entity e,bool boolean)
         {
             World.EntityManager.SetComponentEnabled<NavAgentComponent>(e, boolean);
         }
-        public ComponentType[] RequiredComponents => new ComponentType[]{
+        public static ComponentType[] RequiredComponents => new ComponentType[]{
         typeof(NavAgentComponent),
         typeof(NavAgentTransform),
         typeof(NavAgentPathSteer),
@@ -999,6 +1012,9 @@ namespace Game.Navmesh
                         ///定位在寻路网格上
                         navAgentLocation.NavMeshLocation = NavMeshQuery.MapLocation(itemNavTransform.position, itemNavAgentCom.exetern, itemNavAgentCom.agentType);
                         isShouldEnable = NavMeshQuery.IsValid(navAgentLocation.NavMeshLocation);
+#if UNITY_EDITOR
+                        Debug.Assert(isShouldEnable, "location fail");
+#endif
                     }
 
                     if (isShouldEnable != enabledMask[i])
