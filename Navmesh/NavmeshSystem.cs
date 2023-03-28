@@ -1,5 +1,5 @@
 using System;
-using System.Linq;
+using Game.Math;
 using Unity.Burst;
 using Unity.Burst.Intrinsics;
 using Unity.Collections;
@@ -10,7 +10,8 @@ using Unity.Mathematics;
 using Unity.Transforms;
 using UnityEngine;
 using UnityEngine.Experimental.AI;
-using Random = Unity.Mathematics.Random;
+using static Doozy.Engine.Utils.ColorModels.RGB;
+using static Game.Navmesh.FindPathSystem;
 
 namespace Game.Navmesh
 {
@@ -22,7 +23,7 @@ namespace Game.Navmesh
         private static int process = -1;
         public static int Process { get { if (process == -1) { process = Environment.ProcessorCount - 1; } return process; } } //处理器数量(-1)
         public const int MaxPathSize = 1000;           //可以获得最大路径
-        public const int PreQuerySlot = 3;             //每一个QueryECS处理的QuerySlot
+        public const int PreQuerySlot = 64;             //每一个QueryECS处理的QuerySlot
         public const int PreMaxIterator = 64;          //每一个QueryECS 每一帧处理的最大 路径迭代次数
         public const int InvaildQuerySlot = -1;
         [BurstCompile]
@@ -74,61 +75,96 @@ namespace Game.Navmesh
             //return  math.clamp(p+start,start,end);
         }
 
+        [BurstCompile]
+        public static float3 MoveTowards(float3 current, float3 target, float maxDistanceDelta)
+        {
+            float3 lengthDir = target - current;
+            var lengthsq = math.lengthsq(lengthDir);
+            if (lengthsq == 0f || (maxDistanceDelta >= 0f && lengthsq <= maxDistanceDelta * maxDistanceDelta))
+            {
+                return target;
+            }
+            var length = math.sqrt(lengthsq);
+            return current +  lengthDir / length * maxDistanceDelta;
+        }
     }
 
     public struct QueryECS : IDisposable
     {
         public NavMeshQuery NavMeshQuery;
         public byte UID;
-        public int currentId;
 
         public IntPtr SlotPtr;
         public IntPtr OutputSlotPrt;
-        public void Init(byte uID, NativeSlice<QuerySlot> querySlots, NativeSlice<QuerySlotOutput> querySlotOutputs)
+        //Global id
+        public UnsafeRingQueue<int> freeSlot;
+        //Global id
+        public UnsafeRingQueue<int> useSolt;
+
+        public UnsafeRingQueue<int> completeSlot;
+        public void Init(byte uID, NativeArray<QuerySlot> querySlots, NativeArray<QuerySlotOutput> querySlotOutputs)
         {
             UID = uID;
-            currentId = 0;
+            int ecsIndex = uID;
+            var startIndex = ecsIndex* PathSetting.PreQuerySlot;
+            var endIndex = startIndex + PathSetting.PreQuerySlot;
             //QuerySlots = querySlots;
-            SlotPtr = querySlots.GetUnSafeIntPtr();
-            var span = SlotPtr.AsSpan<QuerySlot>(PathSetting.PreQuerySlot);
-            for (int i = 0; i < span.Length; i++)
+            SlotPtr = querySlots.GetBufferUnSafeIntPtr();
+            var span = SlotPtr.AsSpan<QuerySlot>(PathSetting.PreQuerySlot * PathSetting.Process);
+
+            OutputSlotPrt = querySlotOutputs.GetBufferUnSafeIntPtr();
+            NavMeshQuery = new NavMeshQuery(NavMeshWorld.GetDefaultWorld(), Allocator.Persistent, ushort.MaxValue);
+            freeSlot = new UnsafeRingQueue<int>(PathSetting.PreQuerySlot, Allocator.Persistent);
+            useSolt = new UnsafeRingQueue<int>(PathSetting.PreQuerySlot, Allocator.Persistent);
+            completeSlot = new UnsafeRingQueue<int>(PathSetting.PreQuerySlot, Allocator.Persistent);
+
+            for (int i = startIndex; i < endIndex; i++)
             {
                 span[i].QueryECSIndex = uID;
+                freeSlot.Enqueue(i);
             }
-            OutputSlotPrt = querySlotOutputs.GetUnSafeIntPtr();
-            NavMeshQuery = new NavMeshQuery(NavMeshWorld.GetDefaultWorld(), Allocator.Persistent, ushort.MaxValue);
-
         }
-        public void Update()
+        public void Update(ref QueryECSJob.TypeHandle handle, IntPtr cancelQueryPtr,in UnsafeList<Entity>.ParallelWriter definiteCancel)
         {
-            Span<QuerySlot> spanSlot = SlotPtr.AsSpan<QuerySlot>(PathSetting.PreQuerySlot);
-            var spanSlotOutput = OutputSlotPrt.AsSpan<QuerySlotOutput>(PathSetting.PreQuerySlot);
-
-
-            for (int i = 0; i < PathSetting.PreQuerySlot; i++)
+            ref var cancelQuery =ref cancelQueryPtr.As<UnsafeParallelHashSet<Entity>>();
+            Span<QuerySlot> spanSlot = SlotPtr.AsSpan<QuerySlot>(handle.AllSolt);
+            var spanSlotOutput = OutputSlotPrt.AsSpan<QuerySlotOutput>(handle.AllSolt);
+            var maxIterator = PathSetting.PreMaxIterator;
+            //Debug.Log("slot"+useSolt.Length);
+            while (useSolt.Length>0 && maxIterator>0)
             {
-                ref var slot = ref spanSlot[currentId * PathSetting.PreQuerySlot + i];
+                var soltGlobalIndex =  useSolt.Dequeue();
+                completeSlot.Enqueue(soltGlobalIndex);
+                ref var slot = ref spanSlot[soltGlobalIndex];
+                //Debug.Log(slot.Index + "www" + soltGlobalIndex);
 
-                if (slot.state != SlotState.Ready)
+                //var requestState = handle.RequestStateLookup.AsRef(in slot.entity);
+                //requestState.code = RequestStateCode.InPrograss;
+                if (cancelQuery.Contains(slot.entity))
                 {
-                    slot.state = SlotState.Failure;
+                    definiteCancel.AddNoResize(slot.entity);
+                    QuerySlot.ClearState(ref slot);
+                    continue;
+                }
+
+                ref readonly var navgentTransform = ref handle.navgentTransformLookup.GetRefRO(slot.entity).ValueRO;
+                ref readonly var navgentComponent = ref handle.navagetnComponentLookup.GetRefRO(slot.entity).ValueRO;
+                ref readonly var request = ref handle.RequestLookup.GetRefRO(slot.entity).ValueRO;
+
+                ref readonly var start = ref navgentTransform.position;
+                ref readonly var end = ref request.position;
+                NavMeshLocation startLocation = NavMeshQuery.MapLocation(start, navgentComponent.exetern, navgentComponent.agentType, navgentComponent.areaMask);
+                NavMeshLocation endLocation = NavMeshQuery.MapLocation(end, navgentComponent.exetern, navgentComponent.agentType, navgentComponent.areaMask);
+                if (!NavMeshQuery.IsValid(startLocation) || !NavMeshQuery.IsValid(endLocation) || math.distancesq(startLocation.position, endLocation.position) < navgentComponent.stopDistance * navgentComponent.stopDistance)
+                {
                     slot.PathInfo.status = PathQueryStatus.Failure;
                     continue;
                 }
-                //start stage
-                NavMeshLocation start = NavMeshQuery.MapLocation(slot.Path.start, Vector3.one * 100f, slot.Path.agentType, slot.Path.mask);
-                NavMeshLocation end = NavMeshQuery.MapLocation(slot.Path.end, Vector3.one * 100f, slot.Path.agentType, slot.Path.mask);
-                if (!NavMeshQuery.IsValid(end) || !NavMeshQuery.IsValid(start))
-                {
-                    slot.PathInfo.status = PathQueryStatus.Failure;
-                    slot.state = SlotState.Failure;
-                    continue;
-                }
-                var queryState = NavMeshQuery.BeginFindPath(start, end, slot.Path.mask);
+
+                var queryState = NavMeshQuery.BeginFindPath(startLocation, endLocation, navgentComponent.areaMask);
                 if (queryState.IsFailure())
                 {
                     slot.PathInfo.status = PathQueryStatus.Failure;
-                    slot.state = SlotState.Failure;
                     continue;
                 }
 
@@ -136,22 +172,21 @@ namespace Game.Navmesh
                 while (true)
                 {
                     var state = NavMeshQuery.UpdateFindPath(PathSetting.PreMaxIterator, out var iterationsPerformed);
-
+                    maxIterator -= iterationsPerformed;
                     if (state.IsSuccess())
                     {
                         var endstate = NavMeshQuery.EndFindPath(out int pathSize);
                         if (pathSize > PathSetting.MaxPathSize)
                         {
                             slot.PathInfo.status = PathQueryStatus.Failure;
-                            slot.state = SlotState.Failure;
                         }
                         else
                         {
-                            ref var output = ref spanSlotOutput[currentId];
+                            ref var output = ref spanSlotOutput[slot.Index];
                             if (endstate.IsSuccess())
                             {
                                 NavMeshQuery.GetPathResult(output.polygonIds);
-                                var pathStatus = PathUtils.FindStraightPath(NavMeshQuery, slot.Path.start, slot.Path.end, output.polygonIds, pathSize, ref output.straightPath, ref output.straightPathFlags, ref output.vertexSide, ref slot.PathInfo.cornerCount, PathSetting.MaxPathSize);
+                                var pathStatus = PathUtils.FindStraightPath(NavMeshQuery, start, end, output.polygonIds, pathSize, ref output.straightPath, ref output.straightPathFlags, ref output.vertexSide, ref slot.PathInfo.cornerCount, PathSetting.MaxPathSize);
                                 if (pathStatus.IsSuccess() && slot.PathInfo.cornerCount > 1 && slot.PathInfo.cornerCount <= PathSetting.MaxPathSize)
                                 {
                                     output.wayPoints.Resize(slot.PathInfo.cornerCount, NativeArrayOptions.UninitializedMemory);
@@ -162,12 +197,10 @@ namespace Game.Navmesh
                                     slot.PathInfo.pathSize = slot.PathInfo.cornerCount;
                                     slot.PathInfo.pathFoundToPosition = output.straightPath[slot.PathInfo.cornerCount - 1].position;
                                     slot.PathInfo.status = PathQueryStatus.Success;
-                                    slot.state = SlotState.Success;
                                 }
                                 else
                                 {
                                     slot.PathInfo.status = PathQueryStatus.Failure;
-                                    slot.state = SlotState.Failure;
                                 }
 
                             }
@@ -175,14 +208,12 @@ namespace Game.Navmesh
                             {
 
                                 slot.PathInfo.status = PathQueryStatus.Failure;
-                                slot.state = SlotState.Failure;
                             }
                         }
                         break;
                     }
                     else if (state.IsFailure())
                     {
-                        slot.state = SlotState.Failure;
                         slot.PathInfo.status = PathQueryStatus.Failure;
                         break;
                     }
@@ -194,51 +225,29 @@ namespace Game.Navmesh
             }
 
 
+
         }
 
         public void Dispose()
         {
             NavMeshQuery.Dispose();
+            freeSlot.Dispose();
+            useSolt.Dispose();
+            completeSlot.Dispose();
         }
-    }
 
-    public enum SlotState : int
-    {
-        Idle = 0,
-        Ready,
-        InPrograss,
-        Success,
-        Failure,
     }
-    public struct QuerySlot : IEquatable<QuerySlot>, IDisposable
+    public struct QuerySlot 
     {
-        //Input 
-        public Entity Entity;
-        public RequestPath Path;
-        public SlotState state;
+        public Entity entity;
+        //public RequestInfo Reuquest;
         public int QueryECSIndex;
         public int Index;
         //OutPut
         public PathInfo PathInfo;
         public static void ClearState(ref QuerySlot querySlot)
         {
-            querySlot.Entity = Entity.Null;
-            querySlot.PathInfo = new PathInfo() { cornerCount = 0, pathFoundToPosition = float3.zero, pathSize = 0, QuerySlotIndex = PathSetting.InvaildQuerySlot, status = PathQueryStatus.Failure };
-            querySlot.state = SlotState.Idle;
-        }
-
-        public bool Equals(QuerySlot other)
-        {
-            return this.Entity == other.Entity;
-        }
-
-        public bool IsNull()
-        {
-            return Entity == Entity.Null;
-        }
-        public void Dispose()
-        {
-
+            querySlot.PathInfo = new PathInfo() { cornerCount = 0, pathFoundToPosition = float3.zero, pathSize = 0,  status = PathQueryStatus.Failure };
         }
     }
     public struct QuerySlotOutput : IDisposable
@@ -254,6 +263,7 @@ namespace Game.Navmesh
         public int straightPathFlagsLength;
         public NativeArray<float> vertexSide;
         public int vertexSideLength;
+        public int cornerCount;
         public void Dispose()
         {
             wayPoints.Dispose();
@@ -285,19 +295,40 @@ namespace Game.Navmesh
             querySlotOutput.vertexSideLength = 0;
         }
     }
+
+    public enum RequestStateCode
+    {
+        Idle,
+        InQueue,
+        InPrograss,//考虑分帧请求
+    }
+
+    public struct RequestState : IComponentData
+    {
+        public RequestStateCode code;
+        public int QuerySlotIndex;
+    }
+    public struct RequestInfo
+    {
+        public float3 start;
+        public float3 end;
+        public int mask;
+        public float ThresholdDistance;
+        public int agentType;
+    }
+
     /// <summary>
     /// 路径请求
     /// </summary>
-    public struct RequestPath : IComponentData, IEnableableComponent
+    public struct Request : IComponentData, IEnableableComponent
     {
-        public Entity myself;
-        public float3 start;
-        public float3 end;
-        public int agentIndex;
-        public int agentType;
-        public int mask;
-        public uint uid;
-        public float ThresholdDistance;
+        public float3 position;
+        public RequestCode command;
+        public enum RequestCode
+        {
+            Query,
+            Cancel
+        }
     }
 
     /// <summary>
@@ -307,12 +338,21 @@ namespace Game.Navmesh
     {
         public PathQueryStatus status;
         public int pathSize;
-        public float3 pathFoundToPosition;
         public int cornerCount;
-        public int QuerySlotIndex;
+        public float3 pathFoundToPosition;
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="pos"></param>
+        /// <param name="threshold">lengthsq</param>
+        /// <returns></returns>
+        public readonly bool HasPathByTarget2d(in float2 pos ,float threshold)
+        {
+           return pathSize>0&& math.distancesq(pathFoundToPosition.xz,pos)<threshold&&!status.IsFailure();
+        }
+
     }
-
-
     public struct NavAgentPathSteer : IComponentData, IEnableableComponent
     {
         public int TargetPointIndex;
@@ -347,6 +387,9 @@ namespace Game.Navmesh
         public int areaMask;
         public int agentType;
         public float externLength;
+
+        public readonly static NavAgentComponent Default = new NavAgentComponent() { angleSpeed = 360f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f };
+        
     }
     public struct NavAgentTransform : IComponentData
     {
@@ -371,40 +414,30 @@ namespace Game.Navmesh
 
     public static class NavmeshUtility
     {
-        public static void Setup(Entity e, EntityManager entityManager)
-        {
-            entityManager.AddComponentData<NavAgentComponent>(e, new NavAgentComponent() { angleSpeed = 30f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f });
-            entityManager.AddComponentData<NavAgentTransform>(e, new NavAgentTransform() { position = Unity.Mathematics.float3.zero, rotation = quaternion.identity });
-            entityManager.AddComponentData<NavAgentPathSteer>(e, new NavAgentPathSteer() { TargetPointIndex = 0, PickWayPointDistance = 0.2f });
-            entityManager.AddComponentData<NavAgentLocation>(e, new NavAgentLocation() { });
-            entityManager.AddComponentData<RequestPath>(e, default);
-            entityManager.AddComponentData<PathInfo>(e, default);
-            entityManager.AddBuffer<WayPoint>(e);
-            entityManager.SetComponentEnabled<RequestPath>(e, false);
-            entityManager.SetComponentEnabled<NavAgentComponent>(e, false);
-        }
-        public static void Setup(NativeArray<Entity> e, EntityManager entityManager)
+        public static void Setup(NativeArray<Entity> e, EntityManager entityManager, in NavAgentComponent navAgentComponent)
         {
             FixedList128Bytes<ComponentType> comList = new FixedList128Bytes<ComponentType>
             {
-                Length = 7
+                Length = 8
             };
             comList.Clear();
             comList.AddNoResize(ComponentType.ReadWrite<NavAgentComponent>());
             comList.AddNoResize(ComponentType.ReadWrite<NavAgentTransform>());
             comList.AddNoResize(ComponentType.ReadWrite<NavAgentPathSteer>());
             comList.AddNoResize(ComponentType.ReadWrite<NavAgentLocation>());
-            comList.AddNoResize(ComponentType.ReadWrite<RequestPath>());
+            comList.AddNoResize(ComponentType.ReadWrite<Request>());
+            comList.AddNoResize(ComponentType.ReadWrite<RequestState>());
             comList.AddNoResize(ComponentType.ReadWrite<PathInfo>());
             comList.AddNoResize(ComponentType.ReadWrite<WayPoint>());
             entityManager.AddComponent(e, new ComponentTypeSet(comList));
             for (int i = 0; i < e.Length; i++)
             {
-                entityManager.SetComponentData<NavAgentComponent>(e[i], new NavAgentComponent() { angleSpeed = 30f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f });
+                entityManager.SetComponentData<NavAgentComponent>(e[i],navAgentComponent );
                 entityManager.SetComponentData<NavAgentTransform>(e[i], new NavAgentTransform() { position = Unity.Mathematics.float3.zero, rotation = quaternion.identity });
                 entityManager.SetComponentData<NavAgentPathSteer>(e[i], new NavAgentPathSteer() { TargetPointIndex = 0, PickWayPointDistance = 0.2f });
                 entityManager.SetComponentData<NavAgentLocation>(e[i], new NavAgentLocation() { });
-                entityManager.SetComponentEnabled<RequestPath>(e[i], false);
+                entityManager.SetComponentData<RequestState>(e[i], new RequestState() { code = RequestStateCode.Idle,QuerySlotIndex= PathSetting.InvaildQuerySlot });
+                entityManager.SetComponentEnabled<Request>(e[i], false);
                 entityManager.SetComponentEnabled<NavAgentComponent>(e[i], false);
             }
 
@@ -415,151 +448,11 @@ namespace Game.Navmesh
             entityManager.RemoveComponent<NavAgentTransform>(entities);
             entityManager.RemoveComponent<NavAgentPathSteer>(entities);
             entityManager.RemoveComponent<NavAgentLocation>(entities);
-            entityManager.RemoveComponent<RequestPath>(entities);
-            entityManager.RemoveComponent<PathInfo>(entities);
-            entityManager.RemoveComponent<WayPoint>(entities);
-        }
-        public static void Remove(Entity entities, EntityManager entityManager)
-        {
-            entityManager.RemoveComponent<NavAgentComponent>(entities);
-            entityManager.RemoveComponent<NavAgentTransform>(entities);
-            entityManager.RemoveComponent<NavAgentPathSteer>(entities);
-            entityManager.RemoveComponent<NavAgentLocation>(entities);
-            entityManager.RemoveComponent<RequestPath>(entities);
+            entityManager.RemoveComponent<Request>(entities);
             entityManager.RemoveComponent<PathInfo>(entities);
             entityManager.RemoveComponent<WayPoint>(entities);
         }
     }
-
-#if UNITY_EDITOR
-    public struct OnlyTest : IComponentData
-    {
-        public int INDEX;
-    }
-
-    public readonly partial struct TestAspect : IAspect
-    {
-        public readonly RefRO<OnlyTest> refROTest;
-    }
-
-    [UpdateInGroup(typeof(NavmeshSystem), OrderFirst = true)]
-    public partial class PathTestSystem : SystemBase
-    {
-        public Entity Entity;
-        public EntityQuery entityQuery;
-        public Random RadiuRandom;
-
-        public NativeArray<Entity> EntiyNative;
-
-
-        public static Entity Test;
-        public static bool Boll;
-        protected override void OnCreate()
-        {
-            RadiuRandom = Random.CreateFromIndex(10);
-            Test = EntityManager.CreateEntity();
-            EntityManager.AddComponentData<OnlyTest>(Test, new OnlyTest() { INDEX = 10 });
-        }
-        protected override void OnUpdate()
-        {
-            if (Boll)
-            {
-                Debug.Log(UnityEngine.Time.frameCount);
-                Boll = false;
-            }
-            if (Input.GetKeyDown(KeyCode.Q))
-            {
-                EntityManager.SetComponentData<OnlyTest>(Test, new OnlyTest() { INDEX = (int)SystemAPI.Time.ElapsedTime });
-            }
-
-            if (Input.GetKeyDown(KeyCode.I))
-            {
-                EntityCommandBuffer ecb = new EntityCommandBuffer(Allocator.Temp);
-
-                Entities.ForEach((Entity e, in OnlyTest only) =>
-                {
-                    ecb.AddComponent<NavAgentComponent>(e, new NavAgentComponent() { angleSpeed = 30f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f });
-                    ecb.AddComponent<NavAgentTransform>(e, new NavAgentTransform() { position = Unity.Mathematics.float3.zero, rotation = quaternion.identity });
-                    ecb.AddComponent<NavAgentPathSteer>(e, new NavAgentPathSteer() { TargetPointIndex = 0, PickWayPointDistance = 0.2f });
-                    ecb.AddComponent<NavAgentLocation>(e, new NavAgentLocation() { });
-
-                    ecb.AddComponent<RequestPath>(e);
-                    ecb.AddComponent<PathInfo>(e);
-                    ecb.AddBuffer<WayPoint>(e);
-                    ecb.SetComponentEnabled<RequestPath>(e, false);
-                    ecb.SetComponentEnabled<NavAgentComponent>(e, false);
-                }).WithStoreEntityQueryInField(ref entityQuery).Run();
-                ecb.Playback(EntityManager);
-                ecb.Dispose();
-                var t = entityQuery.ToEntityArray(Allocator.Temp);
-                var min = math.min(1, t.Length);
-                for (int i = 0; i < min; i++)
-                {
-                    EntiyNative = EntityManager.Instantiate(t[0], 1000, Allocator.Persistent);
-                }
-            }
-
-            if (Input.GetKeyDown(KeyCode.Y))
-            {
-                Debug.Log(EntiyNative.Length);
-                Debug.Log(EntityManager.HasComponent<RequestPath>(EntiyNative[0]));
-                for (int i = 0; i < EntiyNative.Length; i++)
-                {
-                    var Entity = EntiyNative[i];
-                    EntityManager.SetComponentEnabled<RequestPath>(Entity, true);
-                    //var pos = EntityManager.GetComponentData<Translation>(Entity).Value;
-                    //UnsafeStream stream = new UnsafeStream();
-                    //stream.AsWriter().Write(EntiyNative)
-                    //System.Runtime.InteropServices.MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref pos,1));
-                    var pos = float3.zero;
-                    if (EntityManager.HasComponent<RequestPath>(Entity))
-                    {
-                        EntityManager.SetComponentData(Entity,
-                        new RequestPath()
-                        {
-                            agentIndex = 0,
-                            agentType = 0,
-                            end = RadiuRandom.NextFloat3(new float3(-30f, 0f, -30f), new float3(30f, 0f, 30f)),
-                            mask = -1,
-                            myself = Entity,
-                            start = pos,
-                            uid = 1,
-                            ThresholdDistance = EntityManager.GetComponentData<NavAgentComponent>(Entity).stopDistance,
-                        });
-                    }
-                    else
-                    {
-                        Debug.Log(i);
-                    }
-
-                }
-
-
-            }
-            new DrawNavPathJob().Run();
-        }
-        protected override void OnDestroy()
-        {
-            if (EntiyNative.IsCreated)
-            {
-                EntiyNative.Dispose();
-            }
-            base.OnDestroy();
-        }
-        public partial struct DrawNavPathJob : IJobEntity
-        {
-            public void Execute(in OnlyTest onlyTest, in PathInfo path, in DynamicBuffer<WayPoint> wayPoints)
-            {
-                if (path.status != PathQueryStatus.Success)
-                {
-                    return;
-                }
-                var read = wayPoints.ToNativeArray(Allocator.Temp).ToArray();
-                DebugHandle.Add(new DrawDotLine(read.Select<WayPoint, Vector3>((a) => { return a.Point; }).ToArray(), 0.5f));
-            }
-        }
-    }
-#endif
     /// <summary>
     /// 这个系统负责寻找路径
     /// </summary>
@@ -574,64 +467,120 @@ namespace Game.Navmesh
         public EntityQuery RequestPathQuery_1;
 
         EndSimulationEntityCommandBufferSystem endBuffer;
-        public ComponentLookup<RequestPath> RequestPathLookup;
-        public ComponentLookup<PathInfo> PathInfoLookup;
-        public ComponentLookup<NavAgentPathSteer> NavAgentPathSteerLookup;
-        public BufferLookup<WayPoint> WayPointLookup;
-        //public TransformAspect.Lookup TransformLookup;
+ 
+        public EntityTypeHandle EntityTypeHandle;
+        public UnsafeParallelHashSet<Entity> CancelRequest;
+        public UnsafeList<Entity> QueueRequestList;
+        public UnsafeList<Entity> DefiniteCancel;
+
+        public EntryQueryQueue.TypeHandle EntryQueryQueueTypeHandle;
+
+        public QueryECSJob.TypeHandle QueryECSJobHandle;
+
+        public GetQuerySlotOutputJob.TypeHandle GetQuerySlotOutputJobTypeHandle;
+
+        private CheckAndEntryQuerySlotJob.TypeHandle CheckAndEntryQuerySlotJobHandle;
+        private RemoveCancelRequestAndResetRequestState.TypeHandle RemoveCancelRequestAndResetRequestStateTypeHandle;
+        public int allSlot;
 
         protected override void OnCreate()
         {
             endBuffer = World.GetExistingSystemManaged<EndSimulationEntityCommandBufferSystem>();
-            var allSlot = PathSetting.Process * PathSetting.PreQuerySlot;
+            allSlot = PathSetting.Process * PathSetting.PreQuerySlot;
             QueryECSArray = new NativeArray<QueryECS>(PathSetting.Process, Allocator.Persistent, NativeArrayOptions.ClearMemory);
             QuerySlotArray = new NativeArray<QuerySlot>(allSlot, Allocator.Persistent, NativeArrayOptions.ClearMemory);
             QuerySlotOutputArray = new NativeArray<QuerySlotOutput>(allSlot, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            var spanQuerySlot = QuerySlotArray.AsSpan();
+            var spanQuerySlotOutput = QuerySlotOutputArray.AsSpan();
+            var QueryECSArraySpan = QueryECSArray.AsSpan();
             for (int i = 0; i < QuerySlotArray.Length; i++)
             {
-                var value = QuerySlotArray[i];
+                ref var value =ref spanQuerySlot[i];
+                ref var output = ref spanQuerySlotOutput[i];
                 value.Index = i;
                 QuerySlot.ClearState(ref value);
-                QuerySlotOutputArray[i] = QuerySlotOutput.Default();
+                output = QuerySlotOutput.Default();
             }
-
-
-            var QueryECSArraySpan = QueryECSArray.AsSpan();
+            
             for (int i = 0; i < PathSetting.Process; i++)
             {
-                var start = i * PathSetting.PreQuerySlot;
-                var length = PathSetting.PreQuerySlot;
-                QueryECSArraySpan[i].Init((byte)i, QuerySlotArray.Slice(start, length), QuerySlotOutputArray.Slice(start, length));
+                //var start = i * PathSetting.PreQuerySlot;
+                //var length = PathSetting.PreQuerySlot;
+                QueryECSArraySpan[i].Init((byte)i, QuerySlotArray, QuerySlotOutputArray);
             }
-            RequestPathQuery_1 = GetEntityQuery(typeof(RequestPath), typeof(WayPoint), typeof(PathInfo));
 
+            QueueRequestList = new UnsafeList<Entity>(allSlot, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            CancelRequest = new UnsafeParallelHashSet<Entity>(64, Allocator.Persistent);
+            DefiniteCancel = new UnsafeList<Entity>(allSlot, Allocator.Persistent);
 
-            RequestPathLookup = GetComponentLookup<RequestPath>(false);
-            PathInfoLookup = GetComponentLookup<PathInfo>(false);
-            NavAgentPathSteerLookup = GetComponentLookup<NavAgentPathSteer>(false);
-            WayPointLookup = GetBufferLookup<WayPoint>(false);
-            //TransformLookup = new TransformAspect.Lookup();
-            //EntityManager.SetComponentData
+            RequestPathQuery_1 = GetEntityQuery(typeof(Request), typeof(RequestState)) ;
+
+            EntryQueryQueueTypeHandle = new EntryQueryQueue.TypeHandle(ref CheckedStateRef);
+            QueryECSJobHandle.Init(ref CheckedStateRef);
+            GetQuerySlotOutputJobTypeHandle = new GetQuerySlotOutputJob.TypeHandle(ref CheckedStateRef);
+            CheckAndEntryQuerySlotJobHandle = new CheckAndEntryQuerySlotJob.TypeHandle(ref CheckedStateRef);
+            RemoveCancelRequestAndResetRequestStateTypeHandle = new RemoveCancelRequestAndResetRequestState.TypeHandle(ref CheckedStateRef);
         }
 
         protected override void OnUpdate()
         {
-            RequestPathLookup.Update(ref CheckedStateRef);
-            PathInfoLookup.Update(ref CheckedStateRef);
-            NavAgentPathSteerLookup.Update(ref CheckedStateRef);
-            WayPointLookup.Update(ref CheckedStateRef);
-            //need dispose
-            var EntityList = RequestPathQuery_1.ToEntityListAsync(Allocator.TempJob, Dependency, out var ArrayJob);
+            EntityTypeHandle.Update(ref CheckedStateRef);
+            EntryQueryQueueTypeHandle.Update(ref CheckedStateRef);
+            QueryECSJobHandle.Update(ref CheckedStateRef);
+            GetQuerySlotOutputJobTypeHandle.Update(ref CheckedStateRef);
+            CheckAndEntryQuerySlotJobHandle.Update(ref CheckedStateRef);
+            RemoveCancelRequestAndResetRequestStateTypeHandle.Update(ref CheckedStateRef);
+            var maxEntryEntity = RequestPathQuery_1.CalculateEntityCountWithoutFiltering();
+            if (QueueRequestList.Capacity - QueueRequestList.Length < maxEntryEntity)
+            {
+                QueueRequestList.SetCapacity(QueueRequestList.Capacity + maxEntryEntity);
+            }
+            
+            Dependency = new EntryQueryQueue()
+            {
+                EntityHandle = EntityTypeHandle,
+                QueueListWriter = QueueRequestList.AsParallelWriter(),
+                CancelQuest = CancelRequest.AsParallelWriter(),
+                typeHandle= EntryQueryQueueTypeHandle
+            }.ScheduleParallel(RequestPathQuery_1, this.Dependency);
 
-            //var requestPathList = RequestPathQuery_1.ToComponentDataListAsync<RequestPath>(Allocator.TempJob, Dependency, out var chunkArrayJob);
-            //var cb = endBuffer.CreateCommandBuffer();
-            //EntityCommandBuffer = new EntityCommandBuffer()
-            var check = new CheckAndEntryQuerySlotJob() { EntityList = EntityList, querySlots = QuerySlotArray, PathInfoLookup = PathInfoLookup, RequestPathLookup = RequestPathLookup, querySlotOutputs = QuerySlotOutputArray.GetUnSafeIntPtr() }.Schedule(ArrayJob);
-            var ecsjob = new QueryECSJob() { QueryECSPtr = QueryECSArray.GetUnSafeIntPtr(), Process = PathSetting.Process }.Schedule(PathSetting.Process, 1, check);
-            Dependency = new GetQuerySlotOutputJob() { NavAgentPathSteerLookup = NavAgentPathSteerLookup, PathInfoLookup = PathInfoLookup, WayPointLookup = WayPointLookup, QuerySlotsArray = QuerySlotArray, QuerySlotsOutputArray = QuerySlotOutputArray.GetUnSafeIntPtr() }.Schedule(ecsjob);
+            Dependency = new CheckAndEntryQuerySlotJob()
+            {
+                typeHandle = CheckAndEntryQuerySlotJobHandle,
+                allSlot = allSlot,
+                process = PathSetting.Process,
+                QueryListPtr = QueueRequestList.AsIntPtr(),
+                querySlots = QuerySlotArray.GetBufferUnSafeIntPtr(),
+                QueryECSArray = QueryECSArray.GetBufferUnSafeIntPtr(),
+            }.Schedule(Dependency);
+
+            Dependency = new QueryECSJob()
+            {
+                handle = QueryECSJobHandle,
+                QueryECSPtr = QueryECSArray.GetBufferUnSafeIntPtr(),
+                Process = PathSetting.Process,
+                cancelQuery = CancelRequest.AsIntPtr(),
+                DefiniteCancel = DefiniteCancel.AsParallelWriter()
+            }.Schedule(PathSetting.Process, 1, Dependency);
+
+            Dependency = new GetQuerySlotOutputJob()
+            {
+                AllSlot = allSlot,
+                process = PathSetting.Process,
+                QueryECS = QueryECSArray.GetBufferUnSafeIntPtr(),
+                typeHandle = GetQuerySlotOutputJobTypeHandle,
+                QuerySlotsArray = QuerySlotArray.GetBufferUnSafeIntPtr(),
+                QuerySlotsOutputArray = QuerySlotOutputArray.GetBufferUnSafeIntPtr()
+            }.Schedule(PathSetting.Process, 1, Dependency);
+
+            Dependency = new RemoveCancelRequestAndResetRequestState() 
+            { 
+                CancelRequest = CancelRequest, 
+                DefiniteCancelPtr = DefiniteCancel.AsIntPtr(), 
+                typeHandle = RemoveCancelRequestAndResetRequestStateTypeHandle 
+            }.Schedule(Dependency);
+
             endBuffer.AddJobHandleForProducer(Dependency);
-            EntityList.Dispose(Dependency);
-            //CompleteDependency();
         }
         protected override void OnDestroy()
         {
@@ -644,50 +593,154 @@ namespace Game.Navmesh
             QueryECSArray.Dispose();
             QuerySlotOutputArray.Dispose();
 
+            QueueRequestList.Dispose();
+            CancelRequest.Dispose();
+            DefiniteCancel.Dispose();
             base.OnDestroy();
         }
 
+        [BurstCompile]
+        public partial struct EntryQueryQueue : IJobChunk
+        {
+            public TypeHandle typeHandle;
+            public UnsafeList<Entity>.ParallelWriter QueueListWriter;
+            public UnsafeParallelHashSet<Entity>.ParallelWriter CancelQuest;
+            [ReadOnly]
+            public EntityTypeHandle EntityHandle;
+            public void Execute(in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask)
+            {
+
+                var mask = chunk.GetEnabledMask(ref typeHandle.RequestCommandHandle);
+                var Enumerator = new ChunkEntityEnumerator(useEnabledMask, chunkEnabledMask, chunk.Count);
+                var readOnlyuSpanRequestCommand = chunk.GetNativeArray(ref typeHandle.RequestCommandHandle).AsReadOnlySpan();
+                var spanRequestState = chunk.GetNativeArray(ref typeHandle.RequesStateHanlde).AsSpan();
+                var readOnlyEntity = chunk.GetNativeArray(EntityHandle).AsReadOnlySpan();
+                while (Enumerator.NextEntityIndex(out var index))
+                {
+                    mask[index] = false;
+                    if (readOnlyuSpanRequestCommand[index].command == Request.RequestCode.Query)
+                    {
+                        if (spanRequestState[index].code == RequestStateCode.Idle)
+                        {
+                            QueueListWriter.AddNoResize(readOnlyEntity[index]);
+                            spanRequestState[index].code = RequestStateCode.InQueue;
+                        }
+                    }
+                    else
+                    {
+                        if (spanRequestState[index].code != RequestStateCode.Idle)
+                        {
+                            CancelQuest.Add(readOnlyEntity[index]);
+                            spanRequestState[index].QuerySlotIndex = PathSetting.InvaildQuerySlot;
+                        }
+                        //else if (spanRequestState[index].code == RequestStateCode.InPrograss)
+                        //{
+                        //    QuerySolt[spanRequestState[index].QuerySlotIndex]
+                        //}
+                    }
+                }
+
+
+            }
+
+
+            public struct TypeHandle
+            {
+                public ComponentTypeHandle<Request> RequestCommandHandle;
+                public ComponentTypeHandle<RequestState> RequesStateHanlde;
+                public TypeHandle(ref SystemState systemState)
+                {
+                    RequestCommandHandle = systemState.GetComponentTypeHandle<Request>(false);
+                    RequesStateHanlde = systemState.GetComponentTypeHandle<RequestState>(false);
+                }
+                public void Update(ref SystemState systemState)
+                {
+                    RequestCommandHandle.Update(ref systemState);
+                    RequesStateHanlde.Update(ref systemState);
+
+                }
+            }
+
+        }
 
         [BurstCompile]
-        public partial struct CheckAndEntryQuerySlotJob : IJob
+        public partial struct CheckAndEntryQuerySlotJob :IJob
         {
-            public ComponentLookup<RequestPath> RequestPathLookup;
-            public ComponentLookup<PathInfo> PathInfoLookup;
-            public NativeList<Entity> EntityList;
-            public NativeArray<QuerySlot> querySlots;
+            [NativeDisableUnsafePtrRestriction()]
+            public IntPtr QueryListPtr;
+
+            public int allSlot;
+            public int process;
 
             [NativeDisableUnsafePtrRestriction()]
-            public IntPtr querySlotOutputs;
+            public IntPtr querySlots;
+            [NativeDisableUnsafePtrRestriction()]
+            public IntPtr QueryECSArray;
+
+            public TypeHandle typeHandle;
             public void Execute()
             {
-                if (EntityList.Length <= 0)
+
+                ref var QueryList = ref QueryListPtr.As<UnsafeList<Entity>>();
+                var allEntity = QueryList.Length;
+                if (allEntity <= 0)
                 {
                     return;
                 }
-                var spanQuerySlot = querySlots.AsSpan();
-                var min = math.min(EntityList.Length, spanQuerySlot.Length);
-                var querySlotOutput = querySlotOutputs.AsSpan<QuerySlotOutput>(querySlots.Length);
+
+                var spanQuerySlot = querySlots.AsSpan<QuerySlot>(allSlot);
+
+                var que = QueryECSArray.AsSpan<QueryECS>(process);
+
+                var idleSlot = 0;
+                for (int i = 0; i < que.Length; i++)
+                {
+                    idleSlot += que[i].freeSlot.Length;
+                }
+                //Debug.Log(idleSlot);
+                //没有槽位
+                if (idleSlot <= 0)
+                {
+                    return;
+                }
+                var min = math.min(allEntity, idleSlot);
+                //Debug.Log("min"+min);
+                var ecsIndex = 0;
+              
                 for (int i = 0; i < min; i++)
                 {
-                    var e = EntityList[i];
-                    RequestPathLookup.SetComponentEnabled(e, false);
-                    ref readonly var requestPath = ref RequestPathLookup.GetRefRO(e).ValueRO;
-                    ref var pathInfoRW = ref PathInfoLookup.GetRefRW(EntityList[i], false).ValueRW;
-                    //无效寻路
-                    if (math.distancesq(requestPath.start, requestPath.end) < requestPath.ThresholdDistance * requestPath.ThresholdDistance)
+                    //Debug.Log("x"+que[ecsIndex].freeSlot.Length);
+                    //Debug.Log("y" + ecsIndex);
+                    if (que[ecsIndex].freeSlot.Length<=0)
                     {
+                        ecsIndex++;
+                        i--;
                         continue;
-
                     }
-                    ref readonly var request = ref RequestPathLookup.GetRefRO(EntityList[i]).ValueRO;
-                    ref var slot = ref spanQuerySlot[i];
-                    slot.Path = request;
-                    slot.Entity = request.myself;
-                    slot.state = SlotState.Ready;
-                    QuerySlotOutput.Clear(ref querySlotOutput[i]);
-                    RequestPathLookup.SetComponentEnabled(request.myself, false);
-                    var rw = PathInfoLookup.GetRefRWOptional(slot.Entity, false);
-                    rw.ValueRW = new PathInfo() { cornerCount = 0, pathFoundToPosition = 0f, pathSize = 0, QuerySlotIndex = i, status = PathQueryStatus.InProgress };
+                    var soltIndex = que[ecsIndex].freeSlot.Dequeue();
+                    que[ecsIndex].useSolt.Enqueue(soltIndex);
+                    //Debug.Log(que[ecsIndex].useSolt.Length +"|"+soltIndex);
+                    QuerySlot.ClearState(ref spanQuerySlot[soltIndex]);
+                    spanQuerySlot[soltIndex].entity = QueryList[i];
+                    ref var rs = ref typeHandle.RequestStateLookup.AsRef(in spanQuerySlot[soltIndex].entity);
+                    rs.QuerySlotIndex = soltIndex;
+                    rs.code = RequestStateCode.InPrograss;
+                }
+                QueryList.RemoveRange(0, min);
+            }
+
+            public struct TypeHandle
+            {
+                [NativeDisableParallelForRestriction]
+                [NativeDisableContainerSafetyRestriction]
+                public ComponentLookup<RequestState> RequestStateLookup;
+                public TypeHandle(ref SystemState systemState)
+                {
+                    RequestStateLookup = systemState.GetComponentLookup<RequestState>();
+                }
+                public void Update(ref SystemState systemState)
+                {
+                    RequestStateLookup.Update(ref  systemState);
                 }
             }
         }
@@ -696,78 +749,197 @@ namespace Game.Navmesh
         {
             [NativeDisableUnsafePtrRestriction()]
             public IntPtr QueryECSPtr;
-
+            [ReadOnly]
+            [NativeDisableUnsafePtrRestriction]
+            public IntPtr cancelQuery;
+            [WriteOnly]
+            [NativeDisableUnsafePtrRestriction]
+            [NativeDisableContainerSafetyRestriction]
+            public UnsafeList<Entity>.ParallelWriter DefiniteCancel;
+            public TypeHandle handle;
             [ReadOnly]
             public int Process;
+
+
             public void Execute(int index)
             {
-                QueryECSPtr.AsSpan<QueryECS>(Process)[index].Update();
+                QueryECSPtr.AsSpan<QueryECS>(Process)[index].Update(
+                    ref handle ,
+                    cancelQuery,
+                    in DefiniteCancel
+                    );
+            }
+            public struct TypeHandle
+            {
+                [ReadOnly]
+                [NativeDisableParallelForRestriction]
+                public ComponentLookup<NavAgentTransform> navgentTransformLookup;
+                [ReadOnly]
+                [NativeDisableParallelForRestriction]
+                public ComponentLookup<NavAgentComponent> navagetnComponentLookup;
+                [ReadOnly]
+                [NativeDisableParallelForRestriction]
+                public ComponentLookup<Request> RequestLookup;
+
+                [ReadOnly]
+                public int AllSolt;
+                public void Init(ref SystemState systemState)
+                {
+                    AllSolt = PathSetting.Process * PathSetting.PreQuerySlot;
+                    navgentTransformLookup = systemState.GetComponentLookup<NavAgentTransform>(true);
+                    navagetnComponentLookup = systemState.GetComponentLookup<NavAgentComponent>(true);
+                    RequestLookup = systemState.GetComponentLookup<Request>(true);
+                    //RequestStateLookup = systemState.GetComponentLookup<RequestState>(false);
+                }
+                public void Update(ref SystemState systemState)
+                {
+                    navgentTransformLookup.Update(ref systemState);
+                    navagetnComponentLookup.Update(ref systemState);
+                    RequestLookup.Update(ref systemState);
+                    //RequestStateLookup.Update(ref systemState);
+                }
             }
         }
         [BurstCompile]
-        public struct GetQuerySlotOutputJob : IJob
+        public struct GetQuerySlotOutputJob : IJobParallelFor
         {
-
-            public NativeArray<QuerySlot> QuerySlotsArray;
+            public TypeHandle typeHandle;
+            [ReadOnly]
+            public int AllSlot;
+            [ReadOnly]
+            public int process;
+            [NativeDisableUnsafePtrRestriction()]
+            public IntPtr QuerySlotsArray;
             [NativeDisableUnsafePtrRestriction()]
             public IntPtr QuerySlotsOutputArray;
-            //public ComponentLookup<RequestPath> RequestPathLookup;
-            public ComponentLookup<PathInfo> PathInfoLookup;
-            public ComponentLookup<NavAgentPathSteer> NavAgentPathSteerLookup;
-            public BufferLookup<WayPoint> WayPointLookup;
-            public void Execute()
+            [NativeDisableUnsafePtrRestriction()]
+            public IntPtr QueryECS;
+            //public void Execute()
+            //{
+
+            //}
+
+            public struct TypeHandle
             {
-                var spanSlotOutput = QuerySlotsOutputArray.AsReadOnlySpan<QuerySlotOutput>(QuerySlotsArray.Length);
-                var spanSlot = QuerySlotsArray.AsSpan();
+                [NativeDisableContainerSafetyRestriction]
+                [NativeDisableParallelForRestriction]
+                public ComponentLookup<PathInfo> PathInfoLookup;
+                [NativeDisableContainerSafetyRestriction]
+                [NativeDisableParallelForRestriction]
+                public ComponentLookup<NavAgentPathSteer> NavAgentPathSteerLookup;
+                [NativeDisableContainerSafetyRestriction]
+                [NativeDisableParallelForRestriction]
+                public ComponentLookup<RequestState> RequestStateLookup;
 
 
-                for (int i = 0; i < spanSlot.Length; i++)
+                [NativeDisableContainerSafetyRestriction]
+                [NativeDisableParallelForRestriction]
+                public BufferLookup<WayPoint> WayPointLookup;
+
+                public TypeHandle(ref SystemState systemState)
                 {
-                    //if (span[i].HasRequest)
-                    //{
-                    //    continue;
-                    //}
+                    PathInfoLookup = systemState.GetComponentLookup<PathInfo>();
+                    NavAgentPathSteerLookup = systemState.GetComponentLookup<NavAgentPathSteer>();
+                    WayPointLookup = systemState.GetBufferLookup<WayPoint>();
+                    RequestStateLookup= systemState.GetComponentLookup<RequestState>();
+                }
+
+                public void Update(ref SystemState systemState)
+                {
+                    PathInfoLookup.Update(ref systemState);
+                    NavAgentPathSteerLookup.Update(ref systemState);
+                    WayPointLookup.Update(ref systemState);
+                    RequestStateLookup.Update(ref systemState);
+                }
+            }
+            public void Execute(int index)
+            {
+                var spanSlotOutput = QuerySlotsOutputArray.AsReadOnlySpan<QuerySlotOutput>(AllSlot);
+                var spanSlot = QuerySlotsArray.AsSpan<QuerySlot>(AllSlot);
+                var spanQueryECS = QueryECS.AsSpan<QueryECS>(process);
+                ref var queryECS =ref spanQueryECS[index];
+                //Debug.Log(queryECS.completeSlot.Length + "xx");
+                //Debug.Log(queryECS.freeSlot.Length + "free");
+                //Debug.Log(queryECS.useSolt.Length + "useSlot");
+                while (queryECS.completeSlot.Length>0)
+                {
+                    int i = queryECS.completeSlot.Dequeue();
+                    queryECS.freeSlot.Enqueue(i);
+                    //Debug.Log("comp" + i);
                     ref var item = ref spanSlot[i];
-                    if (item.Entity == Entity.Null)
+                    ref var requestState = ref typeHandle.RequestStateLookup.AsRef(in item.entity);
+                    requestState.code = RequestStateCode.Idle;
+                    requestState.QuerySlotIndex = PathSetting.InvaildQuerySlot;
+                    switch (item.PathInfo.status)
                     {
-                        return;
-                    }
+                        case PathQueryStatus.Success:
 
-
-                    switch (item.state)
-                    {
-                        case SlotState.Success:
-
-                            var wayPointDynamic = WayPointLookup[item.Entity];
+                            var wayPointDynamic = typeHandle.WayPointLookup[item.entity];
                             wayPointDynamic.Clear();
 
-                            var PathInfo = PathInfoLookup.GetRefRW(item.Entity, false);
+                            var PathInfo = typeHandle.PathInfoLookup.GetRefRW(item.entity, false);
                             PathInfo.ValueRW = item.PathInfo;
                             //ecb.SetComponent<PathInfo>(item.Entity, item.PathInfo);
                             //wayPointDynamic.AddRange(spanSlotOutput[i].wayPoints.AsArray());
-                            var waypointSpan = spanSlotOutput[i].wayPoints.AsSpan();
-                            var NavAgentPathSteerRW = NavAgentPathSteerLookup.GetRefRW(item.Entity, false);
+                            //Debug.Log(spanSlotOutput[i].wayPoints.Length + "query lengt1");
+                            var waypointSpan = spanSlotOutput[i].wayPoints.AsReadOnlySpan();
+                            var NavAgentPathSteerRW = typeHandle.NavAgentPathSteerLookup.GetRefRW(item.entity, false);
                             NavAgentPathSteer.Start(ref NavAgentPathSteerRW.ValueRW);
-                            wayPointDynamic.UnSafeAddSpan(waypointSpan);
-                            //wayPointDynamic.AddRange(waypointSpan.AsArray());
+                            //Debug.Log(waypointSpan.Length + "query lengt");
+                            wayPointDynamic.AddRange(waypointSpan);
+                            //wayPointDynamic.AddRange(spanSlotOutput[i].wayPoints.AsArray())
                             QuerySlot.ClearState(ref item);
                             break;
-                        case SlotState.Failure:
-                            var wayPointDynamicFaile = WayPointLookup[item.Entity];
+                        case PathQueryStatus.Failure:
+                            var wayPointDynamicFaile = typeHandle.WayPointLookup[item.entity];
                             wayPointDynamicFaile.Clear();
-                            var PathInfoFail = PathInfoLookup.GetRefRW(item.Entity, false);
+                            var PathInfoFail = typeHandle.PathInfoLookup.GetRefRW(item.entity, false);
                             PathInfoFail.ValueRW = item.PathInfo;
                             QuerySlot.ClearState(ref item);
                             break;
                         default:
                             break;
-
                     }
 
                 }
             }
         }
 
+        [BurstCompile]
+        public struct RemoveCancelRequestAndResetRequestState : IJob
+        {
+            [NativeDisableUnsafePtrRestriction]
+            public IntPtr DefiniteCancelPtr;
+            public UnsafeParallelHashSet<Entity> CancelRequest;
+            public TypeHandle typeHandle;
+            public void Execute()
+            {
+                ref var DefiniteCancel =ref DefiniteCancelPtr.As<UnsafeList<Entity>>();
+                for (int i = 0; i < DefiniteCancel.Length; i++)
+                {
+                    CancelRequest.Remove(DefiniteCancel[i]);
+                    var state = typeHandle.RequestStateLookup.AsRef(in DefiniteCancel.ElementAt(i));
+                    state.code = RequestStateCode.Idle;
+                    state.QuerySlotIndex = PathSetting.InvaildQuerySlot;
+                }
+                DefiniteCancel.Clear();
+            }
+
+            public struct TypeHandle
+            {
+                public ComponentLookup<RequestState> RequestStateLookup;
+                public TypeHandle(ref SystemState systemState)
+                {
+                    RequestStateLookup =  systemState.GetComponentLookup<RequestState>(false);
+                }
+
+
+                public void Update(ref SystemState systemState)
+                {
+                    RequestStateLookup.Update(ref systemState);
+                }
+            }
+        }
 
     }
 
@@ -808,7 +980,6 @@ namespace Game.Navmesh
         public BufferTypeHandle<WayPoint> WayPointHandle2;
         public ComponentTypeHandle<NavAgentComponent> NavAgentComponentHandle2;
         //[ReadOnly] public ComponentTypeHandle<PathInfo> PathInfoHandle;
-        public TransformAspect.TypeHandle TransformAspectTypeHandle2;
         public ComponentTypeHandle<NavAgentPathSteer> NavAgentPathSteerHandle2;
         public ComponentTypeHandle<NavAgentTransform> NavAgentTransformHandle2;
         public ComponentTypeHandle<NavAgentLocation> NavAgentLocationHandle2;
@@ -864,7 +1035,6 @@ namespace Game.Navmesh
             WayPointHandle2 = GetBufferTypeHandle<WayPoint>(true);
             NavAgentComponentHandle2 = GetComponentTypeHandle<NavAgentComponent>(true);
             //[ReadOnly] public ComponentTypeHandle<PathInfo> PathInfoHandle;
-            TransformAspectTypeHandle2 = new TransformAspect.TypeHandle(ref CheckedStateRef, false);
             NavAgentPathSteerHandle2 = GetComponentTypeHandle<NavAgentPathSteer>(false);
             NavAgentTransformHandle2 = GetComponentTypeHandle<NavAgentTransform>(false);
             NavAgentLocationHandle2 = GetComponentTypeHandle<NavAgentLocation>(false);
@@ -906,7 +1076,6 @@ namespace Game.Navmesh
             NavAgentLocationHandle2.Update(this);
             NavAgentPathSteerHandle2.Update(this);
             NavAgentTransformHandle2.Update(this);
-            TransformAspectTypeHandle2.Update(ref CheckedStateRef);
             WayPointHandle2.Update(this);
             Dependency = new UpdateNavAgentTransformJob()
             {
@@ -929,8 +1098,6 @@ namespace Game.Navmesh
             base.OnDestroy();
         }
 
-
-
         public void SetEnable(Entity e,bool boolean)
         {
             World.EntityManager.SetComponentEnabled<NavAgentComponent>(e, boolean);
@@ -940,7 +1107,7 @@ namespace Game.Navmesh
         typeof(NavAgentTransform),
         typeof(NavAgentPathSteer),
         typeof(NavAgentLocation),
-        typeof(RequestPath),
+        typeof(Request),
         typeof(PathInfo),
         typeof(WayPoint) };
         //public ComponentType[] DepeondComponets => new ComponentType[] { };
@@ -992,7 +1159,7 @@ namespace Game.Navmesh
                     ref readonly var itemNavPathIndex = ref navAgentPathSteerArray[i];
 
                     bool isShouldEnable = true;
-                    var stopdistance = (itemNavAgentCom.stopDistance + itemNavAgentCom.speed * TimeDelta);
+                    var stopdistance = itemNavAgentCom.stopDistance;
                     //1
                     if (
                         //itemPathInfo.status != PathQueryStatus.Success
@@ -1001,7 +1168,6 @@ namespace Game.Navmesh
                         || itemNavPathIndex.streerState == StreerState.Faile
                         || itemNavPathIndex.streerState == StreerState.Over
                         || itemNavPathIndex.TargetPointIndex >= waypointLength
-                        || math.distancesq(itemPathInfo.pathFoundToPosition, itemNavTransform.position) <= stopdistance * stopdistance
                         )
                     {
                         isShouldEnable = false;
@@ -1013,7 +1179,7 @@ namespace Game.Navmesh
                         navAgentLocation.NavMeshLocation = NavMeshQuery.MapLocation(itemNavTransform.position, itemNavAgentCom.exetern, itemNavAgentCom.agentType);
                         isShouldEnable = NavMeshQuery.IsValid(navAgentLocation.NavMeshLocation);
 #if UNITY_EDITOR
-                        Debug.Assert(isShouldEnable, "location fail");
+                        //Debug.Assert(isShouldEnable, "location fail");
 #endif
                     }
 
@@ -1131,51 +1297,85 @@ namespace Game.Navmesh
                             break;
                         case StreerState.Run: break;
                         case StreerState.Faile: continue;
+                        case StreerState.Over:continue;
                         default: break;
                     }
-
-                    ref readonly var end = ref wayPointBufferSpan[navAgentPathSteer.TargetPointIndex];
-
                     var deltaLength = (navAgentCom.speed * TimeDeltaTime);
-                    //var radiu = deltaLength + navAgentCom.stopDistance + navAgentPathSteer.PickWayPointDistance;
+                    //var deltaRadiu = deltaLength + navAgentCom.stopDistance;
 
-
-                    var dir_normal = math.normalizesafe(wayPointBufferSpan[navAgentPathSteer.TargetPointIndex].Point - navAgentTransform.position, math.rotate(navAgentTransform.rotation, math.forward()));
-                    var delta = dir_normal * deltaLength;
-                    var deltaRadiu = deltaLength + navAgentCom.stopDistance;
-                    //corro count
-                    for (int i = navAgentPathSteer.TargetPointIndex; i < wayPointBufferSpan.Length - 1; i++)
+                    float3 final = float3.zero;
+                    float2 deltaDir2D = new float2(0,1);
+                    float3 delatNoraml = math.mul(navAgentTransform.rotation, math.forward());
+                    for (; navAgentPathSteer.TargetPointIndex < wayPointBufferSpan.Length; navAgentPathSteer.TargetPointIndex++)
                     {
-                        if (math.distancesq(wayPointBufferSpan[i].Point, navAgentTransform.position) <= deltaRadiu * deltaRadiu)
+                        ref readonly var end = ref wayPointBufferSpan[navAgentPathSteer.TargetPointIndex];
+                        var deltaDir3D = (end.Point - navAgentTransform.position);
+                        deltaDir2D = deltaDir3D.xz;
+                        var lengthsq = math.lengthsq(deltaDir2D);
+
+                        if (lengthsq == 0f || (deltaLength >= 0f && lengthsq <= deltaLength * deltaLength))
                         {
-                            navAgentPathSteer.start = navAgentTransform.position;
-                            navAgentPathSteer.TargetPointIndex = i + 1;
+                            if (navAgentPathSteer.TargetPointIndex >= wayPointBufferSpan.Length-1)
+                            {
+                                final = wayPointBufferSpan[wayPointBufferSpan.Length - 1].Point;
+                                navAgentPathSteer.streerState = StreerState.Over;
+                            }
+                            continue;
+                        }
+                        else
+                        {
+                            //2d length
+                            var length = math.sqrt(lengthsq);
+
+                            //xz 是normal y 是dot y-length
+                            var dotDelat3d = deltaDir3D / length;
+                            delatNoraml = dotDelat3d;
+                            final = navAgentTransform.position + (dotDelat3d * deltaLength);
+
                             break;
                         }
                     }
 
-                    //end StreerStateover 最后移动一次
-                    if (navAgentPathSteer.TargetPointIndex == wayPointBufferSpan.Length - 1)
-                    {
 
-                        if (math.distancesq(wayPointBufferSpan[navAgentPathSteer.TargetPointIndex].Point, navAgentTransform.position) <= deltaRadiu * deltaRadiu)
-                        {
-                            navAgentPathSteer.streerState = StreerState.Over;
-                            navAgentPathSteer.start = navAgentTransform.position;
-                            navAgentPathSteer.TargetPointIndex = wayPointBufferSpan.Length;
-                        }
-                    }
+                    //for (int i = navAgentPathSteer.TargetPointIndex; i < wayPointBufferSpan.Length - 1; i++)
+                    //{
+                    //    if (math.distancesq(wayPointBufferSpan[i].Point, navAgentTransform.position) <= deltaRadiu * deltaRadiu)
+                    //    {
+                    //        navAgentPathSteer.start = navAgentTransform.position;
+                    //        navAgentPathSteer.TargetPointIndex = i + 1;
+                    //        break;
+                    //    }
+                    //}
+
+                    //var dir_normal = math.normalizesafe(wayPointBufferSpan[navAgentPathSteer.TargetPointIndex].Point - navAgentTransform.position, math.rotate(navAgentTransform.rotation, math.forward()));
+                    //var delta = dir_normal * deltaLength;
+                    ////corro count
+
+
+                    ////end StreerStateover 最后移动一次
+                    //if (navAgentPathSteer.TargetPointIndex == wayPointBufferSpan.Length - 1)
+                    //{
+
+                    //    if (math.distancesq(wayPointBufferSpan[navAgentPathSteer.TargetPointIndex].Point, navAgentTransform.position) <= deltaRadiu * deltaRadiu)
+                    //    {
+                    //        navAgentPathSteer.streerState = StreerState.Over;
+                    //        navAgentPathSteer.start = navAgentTransform.position;
+                    //        navAgentPathSteer.TargetPointIndex = wayPointBufferSpan.Length;
+                    //    }
+                    //}
 
                     locations[count] = navAgentLocation.NavMeshLocation;
                     IndexArray[count] = nextIndex;
-                    TargetArray[count] = navAgentTransform.position + delta;
+                    TargetArray[count] = final;
                     AreaMask[count] = NavAgentComponentArray[count].areaMask;
-                    var targetRotation = quaternion.LookRotationSafe(dir_normal, new float3(0, 1, 0));
-                    navAgentTransform.rotation = math.slerp(navAgentTransform.rotation, targetRotation, TimeDeltaTime * navAgentCom.angleSpeed);
+                    delatNoraml.y = 0f;
+                    var targetRotation = quaternion.LookRotation(delatNoraml, new float3(0, 1, 0));
+                    navAgentTransform.rotation= mathEX.RotateTowards(in navAgentTransform.rotation, in targetRotation, navAgentCom.angleSpeed * TimeDeltaTime);
+                    //navAgentTransform.rotation = math.slerp(navAgentTransform.rotation, targetRotation, TimeDeltaTime * navAgentCom.angleSpeed);
                     count++;
                 }
 
-                //Debug.Log(count);
+                ////Debug.Log(count);
                 navMeshQuery.MoveLocations(locations.Slice(count), TargetArray.Slice(count), AreaMask.Slice(count));
 
                 for (int i = 0; i < count; i++)
