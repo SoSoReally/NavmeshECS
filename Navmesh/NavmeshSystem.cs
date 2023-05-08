@@ -1,6 +1,7 @@
 using System;
 using Game.Math;
 using Unity.Burst;
+using Unity.Burst.CompilerServices;
 using Unity.Burst.Intrinsics;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
@@ -131,9 +132,9 @@ namespace Game.Navmesh
             while (useSolt.Length>0 && maxIterator>0)
             {
                 var soltGlobalIndex =  useSolt.Dequeue();
+
                 completeSlot.Enqueue(soltGlobalIndex);
                 ref var slot = ref spanSlot[soltGlobalIndex];
-
                 ref readonly var navgentTransform = ref handle.navgentTransformLookup.GetRefRO(slot.entity).ValueRO;
                 ref readonly var navgentComponent = ref handle.navagetnComponentLookup.GetRefRO(slot.entity).ValueRO;
                 ref readonly var request = ref handle.RequestLookup.GetRefRO(slot.entity).ValueRO;
@@ -290,7 +291,7 @@ namespace Game.Navmesh
         InPrograss,//考虑分帧请求
     }
 
-    public struct RequestState : ICleanupComponentData
+    public struct RequestState : IComponentData,ICleanupComponentData
     {
         public RequestStateCode code;
         public int QuerySlotIndex;
@@ -369,13 +370,15 @@ namespace Game.Navmesh
     {
         public float speed;
         public float angleSpeed;
+        public half speedSize;
+        public half angleSpeedSize;
         public float stopDistance;
         public float3 exetern;
         public int areaMask;
         public int agentType;
         public float externLength;
 
-        public readonly static NavAgentComponent Default = new NavAgentComponent() { angleSpeed = 360f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f };
+        public readonly static NavAgentComponent Default = new NavAgentComponent() { angleSpeed = 360f, speed = 2f, stopDistance = 0.1f, agentType = 0, areaMask = -1, exetern = 1f , angleSpeedSize = new half(1f), speedSize = new half(1f)};
         
     }
     public struct NavAgentTransform : IComponentData
@@ -452,7 +455,8 @@ namespace Game.Navmesh
     }
 
     public partial class NavmeshSystem : ComponentSystemGroup {
-    
+
+        public static SharedStatic<bool> DebugToggle;
     
     }
 
@@ -486,6 +490,37 @@ namespace Game.Navmesh
             }
 
         }
+
+        public static void Setup(NativeArray<Entity> e, EntityManager entityManager, Span<NavAgentComponent> navAgentComponent)
+        {
+            FixedList128Bytes<ComponentType> comList = new FixedList128Bytes<ComponentType>
+            {
+                Length = 8
+            };
+            comList.Clear();
+            comList.AddNoResize(ComponentType.ReadWrite<NavAgentComponent>());
+            comList.AddNoResize(ComponentType.ReadWrite<NavAgentTransform>());
+            comList.AddNoResize(ComponentType.ReadWrite<NavAgentPathSteer>());
+            comList.AddNoResize(ComponentType.ReadWrite<NavAgentLocation>());
+            comList.AddNoResize(ComponentType.ReadWrite<Request>());
+            comList.AddNoResize(ComponentType.ReadWrite<RequestState>());
+            comList.AddNoResize(ComponentType.ReadWrite<PathInfo>());
+            comList.AddNoResize(ComponentType.ReadWrite<WayPoint>());
+            entityManager.AddComponent(e, new ComponentTypeSet(comList));
+            for (int i = 0; i < e.Length; i++)
+            {
+                entityManager.SetComponentData<NavAgentComponent>(e[i], navAgentComponent[i]);
+                entityManager.SetComponentData<NavAgentTransform>(e[i], new NavAgentTransform() { position = Unity.Mathematics.float3.zero, rotation = quaternion.identity });
+                entityManager.SetComponentData<NavAgentPathSteer>(e[i], new NavAgentPathSteer() { TargetPointIndex = 0, PickWayPointDistance = 0.2f });
+                entityManager.SetComponentData<NavAgentLocation>(e[i], new NavAgentLocation() { });
+                entityManager.SetComponentData<RequestState>(e[i], new RequestState() { code = RequestStateCode.Idle, QuerySlotIndex = PathSetting.InvaildQuerySlot });
+                entityManager.SetComponentEnabled<Request>(e[i], false);
+                entityManager.SetComponentEnabled<NavAgentComponent>(e[i], false);
+            }
+
+        }
+
+
         public static void Remove(NativeArray<Entity> entities, EntityManager entityManager)
         {
             entityManager.RemoveComponent<NavAgentComponent>(entities);
@@ -498,71 +533,6 @@ namespace Game.Navmesh
             entityManager.RemoveComponent<WayPoint>(entities);
         }
     }
-    [BurstCompile]
-    public partial struct Cleanup : ISystem
-    {
-        public EntityQuery ClearQuery;
-        public ClearEntity.TypeHandle ClearEntityTypeHandle;
-        void OnCreate(ref SystemState state) 
-        {
-            ClearQuery = state.GetEntityQuery(new EntityQueryBuilder(Allocator.Temp).WithNone<WayPoint>().WithNone<NavAgentComponent>().WithAll<RequestState>().WithOptions(EntityQueryOptions.IgnoreComponentEnabledState));
-            state.RequireForUpdate(ClearQuery);
-        }
-
-        void OnUpdate(ref SystemState state) 
-        {
-            ClearEntityTypeHandle.Update(ref state);
-            state.Dependency = new ClearEntity()
-            {
-                ecb = SystemAPI.GetSingleton<EndSimulationEntityCommandBufferSystem.Singleton>().CreateCommandBuffer(state.WorldUnmanaged),
-                typeHandle = ClearEntityTypeHandle,
-                CancelList = SystemAPI.GetSingletonRW<Data>().ValueRW.CancelRequest.AsIntPtr(),
-            }.Schedule(ClearQuery, state.Dependency);
-        }
-        [BurstCompile]
-        public partial struct ClearEntity : IJobChunk
-        {
-            public EntityCommandBuffer ecb;
-            [NativeDisableUnsafePtrRestriction]
-            public IntPtr CancelList;
-            public TypeHandle typeHandle;
-
-            public void Execute(in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask)
-            {
-                ref var cancel = ref CancelList.As<UnsafeParallelHashMap<Entity, int>>();
-                UnsafeParallelHashMapCount mapcount = default;
-                var spanRequestState = chunk.GetNativeArray(ref typeHandle.RequesStateHanlde).AsSpan();
-                var Entitys = chunk.GetNativeArray(typeHandle.EntityHandle).AsSpan();
-                for (int i = 0; i < chunk.Count; i++)
-                {
-                    if (spanRequestState[i].code != RequestStateCode.Idle)
-                    {
-                        mapcount.CountAdd(ref cancel, in Entitys[i]);
-                    }
-                }
-                ComponentTypeSet componentTypeSet = new ComponentTypeSet(ComponentType.ReadWrite<RequestState>());
-                ecb.RemoveComponent(Entitys.AsNativeArray(), componentTypeSet);
-            }
-            public struct TypeHandle
-            {
-                public ComponentTypeHandle<RequestState> RequesStateHanlde;
-                [ReadOnly]
-                public EntityTypeHandle EntityHandle;
-                public TypeHandle(ref SystemState systemState)
-                {
-                    RequesStateHanlde = systemState.GetComponentTypeHandle<RequestState>(false);
-                    EntityHandle = systemState.GetEntityTypeHandle();
-                }
-                public void Update(ref SystemState systemState)
-                {
-                    RequesStateHanlde.Update(ref systemState);
-                    EntityHandle.Update(ref systemState);
-                }
-            }
-        }
-
-    }
-
     /// <summary>
     /// 这个系统负责寻找路径
     /// </summary>
@@ -571,15 +541,25 @@ namespace Game.Navmesh
     // 寻路取消会在取消队列里面 会修改寻路状态为idle
     // 寻路取消后 重新请求会进入寻路列表中
     [UpdateInGroup(typeof(NavmeshSystem))]
-    [UpdateAfter(typeof(Cleanup))]
     [BurstCompile]
     public partial struct FindPathSystem : ISystem
     {
 
-        public struct Data: IComponentData
+        public struct Data: IComponentData,IDisposable
         {
-
             public UnsafeParallelHashMap<Entity, int> CancelRequest;
+            public UnsafeHashSet<int> CancelSlot;
+            public Data(int capcity)
+            {
+                CancelRequest = new UnsafeParallelHashMap<Entity, int>(64, Allocator.Persistent);
+                CancelSlot = new UnsafeHashSet<int>(16, Allocator.Persistent);
+            }
+
+            public void Dispose()
+            {
+                CancelRequest.Dispose();
+                CancelSlot.Dispose();
+            }
         }
 
         public NativeArray<QueryECS> QueryECSArray;
@@ -600,7 +580,59 @@ namespace Game.Navmesh
         public EntryCancleQuery.TypeHandle EntryCancleQueryTypeHandle;
         public int allSlot;
 
+        public EntityQuery ClearQuery;
+        public ClearEntity.TypeHandle ClearEntityTypeHandle;
+        [BurstCompile]
+        public partial struct ClearEntity : IJobChunk
+        {
+            public EntityCommandBuffer ecb;
+            [NativeDisableUnsafePtrRestriction]
+            public IntPtr CancelList;
+            public TypeHandle typeHandle;
 
+            public void Execute(in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask)
+            {
+                ref var data = ref CancelList.As<Data>();
+                ref var cancel = ref data.CancelRequest;
+                UnsafeParallelHashMapCount mapcount = default;
+                var readonlySpanRequestState = chunk.GetNativeArray(ref typeHandle.RequestStateComponentTypeHandle).AsReadOnlySpan();
+                var Entitys = chunk.GetNativeArray(typeHandle.EntityHandle).AsReadOnlySpan();
+                //Debug.Log("why no " + Entitys.Length);
+                //Debug.Log(chunk.Count);
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    if (readonlySpanRequestState[i].code == RequestStateCode.InQueue)
+                    {
+                        mapcount.CountAdd(ref cancel, in Entitys[i]);
+                    }
+                    else if (readonlySpanRequestState[i].code == RequestStateCode.InPrograss)
+                    {
+                        data.CancelSlot.Add(readonlySpanRequestState[i].QuerySlotIndex);
+                    }
+                }
+
+
+                ComponentTypeSet componentTypeSet = new ComponentTypeSet(ComponentType.ReadWrite<RequestState>());
+                ecb.RemoveComponent(chunk.GetNativeArray(typeHandle.EntityHandle), in componentTypeSet);
+            }
+            public struct TypeHandle
+            {
+                [ReadOnly]
+                public ComponentTypeHandle<RequestState> RequestStateComponentTypeHandle;
+                [ReadOnly]
+                public EntityTypeHandle EntityHandle;
+                public TypeHandle(ref SystemState systemState)
+                {
+                    EntityHandle = systemState.GetEntityTypeHandle();
+                    RequestStateComponentTypeHandle = systemState.GetComponentTypeHandle<RequestState>(true);
+                }
+                public void Update(ref SystemState systemState)
+                {
+                    EntityHandle.Update(ref systemState);
+                    RequestStateComponentTypeHandle.Update(ref systemState);
+                }
+            }
+        }
         void OnCreate(ref SystemState systemState)
         {
             allSlot = PathSetting.Process * PathSetting.PreQuerySlot;
@@ -626,7 +658,7 @@ namespace Game.Navmesh
                 QueryECSArraySpan[i].Init((byte)i, QuerySlotArray, QuerySlotOutputArray);
             }
 
-            systemState.WorldUnmanaged.EntityManager.AddComponentData<Data>(systemState.SystemHandle, new Data() { CancelRequest = new UnsafeParallelHashMap<Entity, int>(64, Allocator.Persistent) });
+            systemState.WorldUnmanaged.EntityManager.AddComponentData<Data>(systemState.SystemHandle, new Data(16) { });
             QueueRequestList = new UnsafeList<Entity>(allSlot, Allocator.Persistent, NativeArrayOptions.ClearMemory);
             RequestPathQuery_1 = systemState.GetEntityQuery(typeof(Request), typeof(RequestState)) ;
             
@@ -635,6 +667,9 @@ namespace Game.Navmesh
             GetQuerySlotOutputJobTypeHandle = new GetQuerySlotOutputJob.TypeHandle(ref systemState);
             CheckAndEntryQuerySlotJobHandle = new CheckAndEntryQuerySlotJob.TypeHandle(ref systemState);
             EntryCancleQueryTypeHandle = new EntryCancleQuery.TypeHandle(ref systemState);
+
+            ClearQuery = systemState.GetEntityQuery(new EntityQueryBuilder(Allocator.Temp).WithNone<WayPoint>().WithNone<NavAgentComponent>().WithAll<RequestState>().WithOptions(EntityQueryOptions.IncludeDisabledEntities));
+            ClearEntityTypeHandle = new ClearEntity.TypeHandle(ref systemState);
         }
 
         void OnUpdate(ref SystemState systemState)
@@ -651,12 +686,37 @@ namespace Game.Navmesh
                 QueueRequestList.SetCapacity(QueueRequestList.Capacity + maxEntryEntity);
             }
 
+            //return;
+            if (!ClearQuery.IsEmptyIgnoreFilter)
+            {
+                ClearEntityTypeHandle.Update(ref systemState);
+                systemState.Dependency = new ClearEntity()
+                {
+                    ecb = SystemAPI.GetSingleton<EndSimulationEntityCommandBufferSystem.Singleton>().CreateCommandBuffer(systemState.WorldUnmanaged),
+                    typeHandle = ClearEntityTypeHandle,
+                    CancelList = SystemAPI.GetSingletonRW<Data>().ValueRW.AsIntPtr(),
+                }.Schedule(ClearQuery, systemState.Dependency);
+
+                //var d = SystemAPI.GetSingletonRW<Data>().ValueRW.CancelRequest;
+                //var cs = SystemAPI.GetSingletonRW<Data>().ValueRW.CancelSlot;
+                //Debug.Log(d.Count());
+                //Debug.Log(cs.Count);
+                //foreach (var item in d)
+                //{
+                //    Debug.Log(item.Key);
+                //}
+                //foreach (var item in cs)
+                //{
+                //    Debug.Log(item);
+                //}
+                //EntitiesJournaling.Enabled = false;
+            }
 
 
 
             systemState.Dependency = new EntryCancleQuery()
             {
-                CancelRequest = SystemAPI.GetSingletonRW<Data>().ValueRW.CancelRequest.AsIntPtr(),
+                CancelData = SystemAPI.GetComponentRW<Data>(systemState.SystemHandle).ValueRW.AsIntPtr(),
                 typeHandle = EntryCancleQueryTypeHandle
             }.Schedule(RequestPathQuery_1, systemState.Dependency);
 
@@ -677,7 +737,7 @@ namespace Game.Navmesh
                     QueryListPtr = QueueRequestList.AsIntPtr(),
                     querySlots = QuerySlotArray.GetBufferUnSafeIntPtr(),
                     QueryECSArray = QueryECSArray.GetBufferUnSafeIntPtr(),
-                    CancelRequest = SystemAPI.GetSingletonRW<Data>().ValueRW.CancelRequest.AsIntPtr()
+                    CancelData = SystemAPI.GetComponentRW<Data>(systemState.SystemHandle).ValueRW.AsIntPtr()
                 }.Schedule(systemState.Dependency);
             }
 
@@ -713,8 +773,10 @@ namespace Game.Navmesh
             QuerySlotOutputArray.Dispose();
 
             QueueRequestList.Dispose();
-            SystemAPI.GetSingletonRW<Data>().ValueRW.CancelRequest.Dispose();
+            SystemAPI.GetComponentRW<Data>(systemState.SystemHandle).ValueRW.Dispose();
         }
+
+
         /// <summary>
         /// when delete entity
         /// </summary>
@@ -773,7 +835,7 @@ namespace Game.Navmesh
         public partial struct EntryCancleQuery : IJobChunk
         {
             [NativeDisableUnsafePtrRestriction]
-            public IntPtr CancelRequest;
+            public IntPtr CancelData;
             public TypeHandle typeHandle;
             public struct TypeHandle
             {
@@ -804,17 +866,24 @@ namespace Game.Navmesh
                 var readOnlyuSpanRequestCommand = chunk.GetNativeArray(ref typeHandle.RequestCommandHandle).AsReadOnlySpan();
                 var spanRequestState = chunk.GetNativeArray(ref typeHandle.RequesStateHanlde).AsSpan();
                 var readOnlyEntity = chunk.GetNativeArray(typeHandle.EntityHandle).AsReadOnlySpan();
-                ref var map = ref CancelRequest.As<UnsafeParallelHashMap<Entity, int>>();
+                ref var data = ref CancelData.As<Data>();
+                ref var map = ref data.CancelRequest;
                 UnsafeParallelHashMapCount unsafeParallelHashMapCount = default;
                 while (Enumerator.NextEntityIndex(out var index))
                 {
                     if (readOnlyuSpanRequestCommand[index].command == Request.RequestCode.Cancel)
                     {
-                        if (spanRequestState[index].code != RequestStateCode.Idle)
+                        if (spanRequestState[index].code == RequestStateCode.InQueue)
                         {
                             spanRequestState[index].QuerySlotIndex = PathSetting.InvaildQuerySlot;
                             spanRequestState[index].code = RequestStateCode.Idle;
                             unsafeParallelHashMapCount.CountAdd(ref map, in readOnlyEntity[index]);
+                        }
+                        else if(spanRequestState[index].code == RequestStateCode.InPrograss)
+                        {
+                            data.CancelSlot.Add(spanRequestState[index].QuerySlotIndex);
+                            spanRequestState[index].QuerySlotIndex = PathSetting.InvaildQuerySlot;
+                            spanRequestState[index].code = RequestStateCode.Idle;
                         }
                     }
                 }
@@ -825,14 +894,14 @@ namespace Game.Navmesh
         /// <summary>
         /// check form queue and join slot
         /// </summary>
-        [BurstCompile]
+        [BurstCompile()]
         public partial struct CheckAndEntryQuerySlotJob :IJob
         {
             [NativeDisableUnsafePtrRestriction()]
             public IntPtr QueryListPtr;
 
             [NativeDisableUnsafePtrRestriction]
-            public IntPtr CancelRequest;
+            public IntPtr CancelData;
             [ReadOnly]
             public int allSlot;
             [ReadOnly]
@@ -844,9 +913,48 @@ namespace Game.Navmesh
             public IntPtr QueryECSArray;
 
             public TypeHandle typeHandle;
+
+            [SkipLocalsInit()]
             public void Execute()
             {
-                ref var cancelRequest = ref CancelRequest.As<UnsafeParallelHashMap<Entity, int>>();
+                ref var data = ref CancelData.As<Data>();
+                ref var cancelRequest = ref data.CancelRequest;
+                var spanQuerySlot = querySlots.AsSpan<QuerySlot>(allSlot);
+                var que = QueryECSArray.AsSpan<QueryECS>(process);
+                var cancelOnSlot = data.CancelSlot.Count;
+
+                if (cancelOnSlot>0)
+                {
+                    for (int i = 0; i < que.Length; i++)
+                    {
+                        var tempLength = que[i].useSolt.Length;
+                        for (int ri = tempLength-1; ri >= 0; ri--)
+                        {
+                            var dvalue = que[i].useSolt.Dequeue();
+                            if (data.CancelSlot.Contains(dvalue))
+                            {
+                                //Debug.Log(dvalue);
+                                data.CancelSlot.Remove(dvalue);
+                                que[i].freeSlot.Enqueue(dvalue);
+                            }
+                            else
+                            {
+                                que[i].useSolt.Enqueue(dvalue);
+                            }
+                        }
+                    }
+                }
+
+                if (data.CancelSlot.Count>0)
+                {
+                    //foreach (var item in data.CancelSlot)
+                    //{
+                    //    Debug.Log(item);
+                    //}
+                    //Debug.Log("取消的slot 不在useslot中");
+                    return;
+                }
+
                 UnsafeParallelHashMapCount unsafeParallelHashMapCount = default;
                 ref var QueryList = ref QueryListPtr.As<UnsafeList<Entity>>();
                 var allEntity = QueryList.Length;
@@ -855,9 +963,7 @@ namespace Game.Navmesh
                     return;
                 }
 
-                var spanQuerySlot = querySlots.AsSpan<QuerySlot>(allSlot);
 
-                var que = QueryECSArray.AsSpan<QueryECS>(process);
 
                 var idleSlot = 0;
                 for (int i = 0; i < que.Length; i++)
@@ -873,16 +979,21 @@ namespace Game.Navmesh
                 var min = math.min(allEntity, idleSlot);
                 var ecsIndex = 0;
                 var invalidEntityoffest = 0;
-                var actualRemove = 0;
+                var actualRemove = -1;
+                 
+               
                 for (int i = 0; i < min; i++)
                 {
                     actualRemove = i + invalidEntityoffest;
                     if (actualRemove >= QueryList.Length)
                     {
+                        //actualRemove = [0,list.length)
+                        actualRemove--;
                         break;
                     }
                     if (unsafeParallelHashMapCount.CountRemove(ref cancelRequest, in QueryList.ElementAt(actualRemove)))
                     {
+                        //Debug.Log(QueryList.ElementAt(actualRemove) +" sss");
                         invalidEntityoffest++;
                         i--;                        
                         continue;
@@ -904,7 +1015,8 @@ namespace Game.Navmesh
                     rs.QuerySlotIndex = soltIndex;
                     rs.code = RequestStateCode.InPrograss;
                 }
-                QueryList.RemoveRange(0, actualRemove);
+                //actualRemove is removeIndex so plus one
+                QueryList.RemoveRange(0, actualRemove+1);
             }
 
             public struct TypeHandle
@@ -1434,7 +1546,7 @@ namespace Game.Navmesh
                         case StreerState.Over:continue;
                         default: break;
                     }
-                    var deltaLength = (navAgentCom.speed * TimeDeltaTime);
+                    var deltaLength = (navAgentCom.speed * navAgentCom.speedSize* TimeDeltaTime);
                     //var deltaRadiu = deltaLength + navAgentCom.stopDistance;
 
                     float3 final = float3.zero;
@@ -1504,7 +1616,7 @@ namespace Game.Navmesh
                     AreaMask[count] = NavAgentComponentArray[count].areaMask;
                     delatNoraml.y = 0f;
                     var targetRotation = quaternion.LookRotation(delatNoraml, new float3(0, 1, 0));
-                    navAgentTransform.rotation= mathEX.RotateTowards(in navAgentTransform.rotation, in targetRotation, navAgentCom.angleSpeed * TimeDeltaTime);
+                    navAgentTransform.rotation= mathEX.RotateTowards(in navAgentTransform.rotation, in targetRotation, navAgentCom.angleSpeed * navAgentCom.angleSpeedSize * TimeDeltaTime);
                     //navAgentTransform.rotation = math.slerp(navAgentTransform.rotation, targetRotation, TimeDeltaTime * navAgentCom.angleSpeed);
                     count++;
                 }
