@@ -16,7 +16,6 @@ namespace Game.Navmesh
 {
 
     //note 如果导航steerstate.faile失败是否需要重新寻路？
-
     public static class PathSetting
     {
         private static int process = -1;
@@ -25,67 +24,68 @@ namespace Game.Navmesh
         public const int PreQuerySlot = 64;             //每一个QueryECS处理的QuerySlot
         public const int PreMaxIterator = 64;          //每一个QueryECS 每一帧处理的最大 路径迭代次数
         public const int InvaildQuerySlot = -1;
-        [BurstCompile]
-        public static Vector3 GetClosestPointOnFiniteLine(Vector3 point, Vector3 line_start, Vector3 line_end)
-        {
-            Vector3 line_direction = line_end - line_start;
-            float line_length = line_direction.magnitude;
-            line_direction.Normalize();
-            float project_length = Mathf.Clamp(Vector3.Dot(point - line_start, line_direction), 0f, line_length);
-            return line_start + line_direction * project_length;
-        }
-        [BurstCompile]
-        // For infinite lines:
-        public static Vector3 GetClosestPointOnInfiniteLine(Vector3 point, Vector3 line_start, Vector3 line_end)
-        {
-            return line_start + Vector3.Project(point - line_start, line_end - line_start);
-        }
+        //[BurstCompile]
+        //public static Vector3 GetClosestPointOnFiniteLine(Vector3 point, Vector3 line_start, Vector3 line_end)
+        //{
+        //    Vector3 line_direction = line_end - line_start;
+        //    float line_length = line_direction.magnitude;
+        //    line_direction.Normalize();
+        //    float project_length = Mathf.Clamp(Vector3.Dot(point - line_start, line_direction), 0f, line_length);
+        //    return line_start + line_direction * project_length;
+        //}
+        ////[BurstCompile]
+        //// For infinite lines:
+        //public static Vector3 GetClosestPointOnInfiniteLine(Vector3 point, Vector3 line_start, Vector3 line_end)
+        //{
+        //    return line_start + Vector3.Project(point - line_start, line_end - line_start);
+        //}
 
 
-        [BurstCompile]
-        public static bool IsPointClosestLine(in float3 start, in float3 end, in float3 point, float radiu)
-        {
-            if (math.all((start - end) == float3.zero)) return math.distancesq(start, point) <= radiu * radiu;
-            var cloasetPoint = GetClosestPointOnFiniteLine(in start, in end, in point);
-            return math.distancesq(cloasetPoint, point) <= radiu * radiu;
-        }
-        public static bool IsPointClosestLineSq(in float3 start, in float3 end, in float3 point, float radiusq)
-        {
-            var cloasetPoint = GetClosestPointOnFiniteLine(in start, in end, in point);
-            return math.distancesq(cloasetPoint, point) <= radiusq;
-        }
+        //[BurstCompile]
+        //public static bool IsPointClosestLine(in float3 start, in float3 end, in float3 point, float radiu)
+        //{
+        //    if (math.all((start - end) == float3.zero)) return math.distancesq(start, point) <= radiu * radiu;
+        //    var cloasetPoint = GetClosestPointOnFiniteLine(in start, in end, in point);
+        //    return math.distancesq(cloasetPoint, point) <= radiu * radiu;
+        //}
+        ////[BurstCompile]
+        //public static bool IsPointClosestLineSq(in float3 start, in float3 end, in float3 point, float radiusq)
+        //{
+        //    var cloasetPoint = GetClosestPointOnFiniteLine(in start, in end, in point);
+        //    return math.distancesq(cloasetPoint, point) <= radiusq;
+        //}
 
-        [BurstCompile]
-        public static float3 GetClosestPointOnFiniteLine(in float3 start, in float3 end, in float3 point)
-        {
-            var u = point - start;
-            var v = end - start;
-            var length = math.length(v);
-            var dir = math.normalize(v);
-            var p_length = math.clamp(math.dot(u, dir), 0f, length);
-            return start + p_length * dir;
-        }
+        ////[BurstCompile]
+        //public static void GetClosestPointOnFiniteLine(in float3 start, in float3 end, in float3 point,ref float3 result)
+        //{
+        //    var u = point - start;
+        //    var v = end - start;
+        //    var length = math.length(v);
+        //    var dir = math.normalize(v);
+        //    var p_length = math.clamp(math.dot(u, dir), 0f, length);
+        //    result = start + p_length * dir;
+        //}
+        ////[BurstCompile]
+        //public static float3 GetClosestPointOnInfiniteLine(in float3 start, in float3 end, in float3 point)
+        //{
+        //    var u = point - start;
+        //    var v = end - start;
+        //    return start + math.project(u, math.normalize(v));
+        //    //return  math.clamp(p+start,start,end);
+        //}
 
-        public static float3 GetClosestPointOnInfiniteLine(in float3 start, in float3 end, in float3 point)
-        {
-            var u = point - start;
-            var v = end - start;
-            return start + math.project(u, math.normalize(v));
-            //return  math.clamp(p+start,start,end);
-        }
-
-        [BurstCompile]
-        public static float3 MoveTowards(float3 current, float3 target, float maxDistanceDelta)
-        {
-            float3 lengthDir = target - current;
-            var lengthsq = math.lengthsq(lengthDir);
-            if (lengthsq == 0f || (maxDistanceDelta >= 0f && lengthsq <= maxDistanceDelta * maxDistanceDelta))
-            {
-                return target;
-            }
-            var length = math.sqrt(lengthsq);
-            return current +  lengthDir / length * maxDistanceDelta;
-        }
+        ////[BurstCompile]
+        //public static float3 MoveTowards(float3 current, float3 target, float maxDistanceDelta)
+        //{
+        //    float3 lengthDir = target - current;
+        //    var lengthsq = math.lengthsq(lengthDir);
+        //    if (lengthsq == 0f || (maxDistanceDelta >= 0f && lengthsq <= maxDistanceDelta * maxDistanceDelta))
+        //    {
+        //        return target;
+        //    }
+        //    var length = math.sqrt(lengthsq);
+        //    return current +  lengthDir / length * maxDistanceDelta;
+        //}
     }
 
     public struct QueryECS : IDisposable
@@ -215,7 +215,6 @@ namespace Game.Navmesh
 
 
         }
-
         public void Dispose()
         {
             NavMeshQuery.Dispose();
@@ -223,7 +222,6 @@ namespace Game.Navmesh
             useSolt.Dispose();
             completeSlot.Dispose();
         }
-
     }
     public struct QuerySlot 
     {
@@ -1167,13 +1165,13 @@ namespace Game.Navmesh
                             var wayPointDynamic = typeHandle.WayPointLookup[item.entity];
                             wayPointDynamic.Clear();
 
-                            var PathInfo = typeHandle.PathInfoLookup.GetRefRW(item.entity, false);
+                            var PathInfo = typeHandle.PathInfoLookup.GetRefRW(item.entity);
                             PathInfo.ValueRW = item.PathInfo;
                             //ecb.SetComponent<PathInfo>(item.Entity, item.PathInfo);
                             //wayPointDynamic.AddRange(spanSlotOutput[i].wayPoints.AsArray());
                             //Debug.Log(spanSlotOutput[i].wayPoints.Length + "query lengt1");
                             var waypointSpan = spanSlotOutput[i].wayPoints.AsReadOnlySpan();
-                            var NavAgentPathSteerRW = typeHandle.NavAgentPathSteerLookup.GetRefRW(item.entity, false);
+                            var NavAgentPathSteerRW = typeHandle.NavAgentPathSteerLookup.GetRefRW(item.entity);
                             NavAgentPathSteer.Start(ref NavAgentPathSteerRW.ValueRW);
                             //Debug.Log(waypointSpan.Length + "query lengt");
                             wayPointDynamic.AddRange(waypointSpan);
@@ -1183,7 +1181,7 @@ namespace Game.Navmesh
                         case PathQueryStatus.Failure:
                             var wayPointDynamicFaile = typeHandle.WayPointLookup[item.entity];
                             wayPointDynamicFaile.Clear();
-                            var PathInfoFail = typeHandle.PathInfoLookup.GetRefRW(item.entity, false);
+                            var PathInfoFail = typeHandle.PathInfoLookup.GetRefRW(item.entity);
                             PathInfoFail.ValueRW = item.PathInfo;
                             QuerySlot.ClearState(ref item);
                             break;

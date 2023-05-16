@@ -1,0 +1,23 @@
+{
+    "name": "Navmesh",
+    "rootNamespace": "",
+    "references": [
+        "GUID:2665a8d13d1b3f18800f46e256720795",
+        "GUID:734d92eba21c94caba915361bd5ac177",
+        "GUID:8c4dd21966739024fbd72155091d199e",
+        "GUID:d8b63aba1907145bea998dd612889d6b",
+        "GUID:7ded120872e29a34581be6c0af7dab8a",
+        "GUID:e0cd26848372d4e5c891c569017e11f1",
+        "GUID:d13830060dc26fa46bbd428772ecfa25",
+        "GUID:181fde5e9dd55b34585a93cce9f36ef1"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
