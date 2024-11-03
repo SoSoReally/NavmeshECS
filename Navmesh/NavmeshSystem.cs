@@ -452,9 +452,10 @@ namespace Game.Navmesh
         }
     }
 
+    [DisableAutoCreation]
     public partial class NavmeshSystem : ComponentSystemGroup {
 
-        public static SharedStatic<bool> DebugToggle;
+
     
     }
 
@@ -631,7 +632,7 @@ namespace Game.Navmesh
                 }
             }
         }
-        void OnCreate(ref SystemState systemState)
+        public void OnCreate(ref SystemState systemState)
         {
             allSlot = PathSetting.Process * PathSetting.PreQuerySlot;
             QueryECSArray = new NativeArray<QueryECS>(PathSetting.Process, Allocator.Persistent, NativeArrayOptions.ClearMemory);
@@ -670,7 +671,7 @@ namespace Game.Navmesh
             ClearEntityTypeHandle = new ClearEntity.TypeHandle(ref systemState);
         }
 
-        void OnUpdate(ref SystemState systemState)
+        public void OnUpdate(ref SystemState systemState)
         {
             EntityTypeHandle.Update(ref systemState);
             EntryQueryQueueTypeHandle.Update(ref systemState);
@@ -692,7 +693,7 @@ namespace Game.Navmesh
                 {
                     ecb = SystemAPI.GetSingleton<EndSimulationEntityCommandBufferSystem.Singleton>().CreateCommandBuffer(systemState.WorldUnmanaged),
                     typeHandle = ClearEntityTypeHandle,
-                    CancelList = SystemAPI.GetSingletonRW<Data>().ValueRW.AsIntPtr(),
+                    CancelList = UnsafeCode.AsIntPtrByReadOnly(SystemAPI.GetSingletonRW<Data>().ValueRW),
                 }.Schedule(ClearQuery, systemState.Dependency);
 
                 //var d = SystemAPI.GetSingletonRW<Data>().ValueRW.CancelRequest;
@@ -714,7 +715,7 @@ namespace Game.Navmesh
 
             systemState.Dependency = new EntryCancleQuery()
             {
-                CancelData = SystemAPI.GetComponentRW<Data>(systemState.SystemHandle).ValueRW.AsIntPtr(),
+                CancelData = UnsafeCode.AsIntPtrByReadOnly(SystemAPI.GetComponentRW<Data>(systemState.SystemHandle).ValueRW),
                 typeHandle = EntryCancleQueryTypeHandle
             }.Schedule(RequestPathQuery_1, systemState.Dependency);
 
@@ -732,10 +733,10 @@ namespace Game.Navmesh
                     typeHandle = CheckAndEntryQuerySlotJobHandle,
                     allSlot = allSlot,
                     process = PathSetting.Process,
-                    QueryListPtr = QueueRequestList.AsIntPtr(),
+                    QueryListPtr = UnsafeCode.AsIntPtrByReadOnly(QueueRequestList),
                     querySlots = QuerySlotArray.GetBufferUnSafeIntPtr(),
                     QueryECSArray = QueryECSArray.GetBufferUnSafeIntPtr(),
-                    CancelData = SystemAPI.GetComponentRW<Data>(systemState.SystemHandle).ValueRW.AsIntPtr()
+                    CancelData = UnsafeCode.AsIntPtrByReadOnly(SystemAPI.GetComponentRW<Data>(systemState.SystemHandle).ValueRW)
                 }.Schedule(systemState.Dependency);
             }
 
@@ -759,7 +760,7 @@ namespace Game.Navmesh
 
 
         }
-        void OnDestroy(ref SystemState systemState)
+        public void OnDestroy(ref SystemState systemState)
         {
             systemState.CompleteDependency();
             for (int i = 0; i < QuerySlotOutputArray.Length; i++)
@@ -1237,7 +1238,7 @@ namespace Game.Navmesh
         public ComponentTypeHandle<NavAgentLocation> NavAgentLocationHandle2;
 
 
-         void OnCreate(ref SystemState systemState)
+        public void OnCreate(ref SystemState systemState)
         {
             OnlyLocation = new NavMeshQuery(NavMeshWorld.GetDefaultWorld(), Allocator.Persistent);
 
@@ -1291,7 +1292,7 @@ namespace Game.Navmesh
             NavAgentLocationHandle2 = systemState.GetComponentTypeHandle<NavAgentLocation>(false);
         }
 
-        void OnUpdate(ref SystemState systemState)
+        public void OnUpdate(ref SystemState systemState)
         {
             NavAgentComponentHandle.Update(ref systemState);
             NavTransformTypeHandle.Update(ref systemState);
