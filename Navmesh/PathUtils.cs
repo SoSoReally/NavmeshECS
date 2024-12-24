@@ -22,7 +22,6 @@ using System;
 using Unity.Collections;
 using Unity.Mathematics;
 using UnityEngine;
-using UnityEngine.Assertions;
 using UnityEngine.Experimental.AI;
 
 [Flags]
